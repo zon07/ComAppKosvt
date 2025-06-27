@@ -35,32 +35,43 @@ class SensorApp:
         self.read_thread.start()
 
     def create_widgets(self):
-        # Control panel
-        control_frame = tk.Frame(self.root)
-        control_frame.pack(fill=tk.X, padx=5, pady=5)
+        # Main container frame
+        main_frame = tk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # COM port selection
-        tk.Label(control_frame, text="COM порт:").pack(side=tk.LEFT)
+        # Control panel - вертикальное расположение
+        control_frame = tk.Frame(main_frame)
+        control_frame.pack(fill=tk.X, pady=5)
         
-        self.port_combobox = ttk.Combobox(control_frame, state="readonly", width=15)
+        # COM port selection - первая строка
+        com_frame = tk.Frame(control_frame)
+        com_frame.pack(fill=tk.X, pady=2)
+        
+        tk.Label(com_frame, text="COM порт:").pack(side=tk.LEFT)
+        
+        self.port_combobox = ttk.Combobox(com_frame, state="readonly", width=15)
         self.port_combobox.pack(side=tk.LEFT, padx=5)
         
-        self.connect_btn = tk.Button(control_frame, text="Подключиться", command=self.connect_to_port)
+        self.connect_btn = tk.Button(com_frame, text="Подключиться", command=self.connect_to_port)
         self.connect_btn.pack(side=tk.LEFT, padx=5)
         
-        self.disconnect_btn = tk.Button(control_frame, text="Закрыть порт", 
+        self.disconnect_btn = tk.Button(com_frame, text="Закрыть порт", 
                                       command=self.disconnect_port, state=tk.DISABLED)
         self.disconnect_btn.pack(side=tk.LEFT, padx=5)
         
-        self.refresh_btn = tk.Button(control_frame, text="Обновить список", command=self.update_ports_list)
+        self.refresh_btn = tk.Button(com_frame, text="Обновить список", command=self.update_ports_list)
         self.refresh_btn.pack(side=tk.LEFT)
         
-        self.status_label = tk.Label(control_frame, text="Статус: Не подключено")
-        self.status_label.pack(side=tk.RIGHT)
+        # Status label - вторая строка (под COM портом)
+        status_frame = tk.Frame(control_frame)
+        status_frame.pack(fill=tk.X, pady=2)
+        
+        self.status_label = tk.Label(status_frame, text="Статус: Не подключено", anchor='w')
+        self.status_label.pack(fill=tk.X)
         
         # Notebook (tabs)
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
         
         # System tab
         self.system_tab = tk.Frame(self.notebook)
