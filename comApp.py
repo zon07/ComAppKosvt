@@ -14,7 +14,15 @@ class SensorApp:
         self.sensors_count = 0
         self.sensor_data = {}
         self.sensor_widgets = {}
-        self.current_sensor_index = 0  # Текущий индекс для запроса данных
+        self.current_sensor_index = 0
+        self.sensor_order = []
+        self.sensor_names = [
+            "Датчик Dust",
+            "Датчик Temp 1",
+            "Датчик Humid 1",
+            "Датчик Temp 2",
+            "Датчик Humid 2"
+        ]
         
         self.create_widgets()
         self.update_ports_list()
@@ -24,13 +32,13 @@ class SensorApp:
         self.read_thread.start()
         
         self.update_data()
-    
+
     def create_widgets(self):
-        # Панель управления
+        # Control panel
         control_frame = tk.Frame(self.root)
         control_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Выбор COM-порта
+        # COM port selection
         tk.Label(control_frame, text="COM порт:").pack(side=tk.LEFT)
         
         self.port_combobox = ttk.Combobox(control_frame, state="readonly", width=15)
@@ -45,11 +53,11 @@ class SensorApp:
         self.status_label = tk.Label(control_frame, text="Статус: Не подключено")
         self.status_label.pack(side=tk.RIGHT)
         
-        # Создание Notebook (вкладки)
+        # Notebook (tabs)
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Вкладка для информации о системе
+        # System tab
         self.system_tab = tk.Frame(self.notebook)
         self.notebook.add(self.system_tab, text="Система")
         
@@ -58,7 +66,7 @@ class SensorApp:
         self.system_text.insert(tk.END, "Ожидание подключения к устройству...\n")
         self.system_text.config(state=tk.DISABLED)
         
-        # Контекстное меню
+        # Context menu
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="Копировать", command=self.copy_from_log)
         self.context_menu.add_command(label="Очистить лог", command=self.clear_log)
@@ -135,11 +143,9 @@ class SensorApp:
             self.log_message("Отправлен запрос количества датчиков: 41 41 02 00 01")
     
     def request_sensor_data(self, sensor_index):
-        """Запрос данных конкретного датчика"""
         if not 0 <= sensor_index < self.sensors_count:
             return
             
-        # Устанавливаем текущий индекс
         self.current_sensor_index = sensor_index
         
         request = bytes([0x41, 0x41, 0x04, 0x00, 0x02, 0x00, sensor_index])
@@ -175,34 +181,25 @@ class SensorApp:
                 if message_end > len(data):
                     break
                     
-                # Ответ о количестве датчиков
+                # Sensor count response
                 if payload_len == 1:
                     self.sensors_count = data[pos+3]
                     self.log_message(f"Получено количество датчиков: {self.sensors_count}")
-                    self.root.after(0, self.update_sensor_tabs)
+                    self.sensor_order = list(range(self.sensors_count))
+                    self.root.after(0, self.create_sensor_tabs_in_order)
                     pos = message_end
                     continue
                     
-                # Данные датчика
+                # Sensor data response
                 if payload_len == 8 and len(data[pos:message_end]) >= 11:
                     try:
-                        # Согласно вашему протоколу структура данных:
-                        # [A][A][LEN][DATA]
-                        # Где DATA: 
-                        # 0: тип сенсора (1 байт)
-                        # 1-2: value (2 байта, little-endian)
-                        # 3-4: gain (2 байта, little-endian)
-                        # 5-6: offset (2 байта, little-endian)
-                        # 7: isDataValid (1 байт)
-                                                
-                        # Используем текущий индекс датчика, так как его нет в сообщении
                         sensor_index = self.current_sensor_index
+                        sensor_type = data[pos+3]
                         
-                        sensor_type = data[pos+3]                   # 0-й байт данных
-                        value = data[pos+4] | (data[pos+5] << 8)    # 1-2 байты
-                        gain = data[pos+6] | (data[pos+7] << 8)     # 3-4 байты
-                        offset = data[pos+8] | (data[pos+9] << 8)   # 5-6 байты
-                        is_valid = data[pos+10]                     # 7-й байт
+                        value = data[pos+4] | (data[pos+5] << 8)
+                        gain = data[pos+6] | (data[pos+7] << 8)
+                        offset = data[pos+8] | (data[pos+9] << 8)
+                        is_valid = data[pos+10]
                         
                         self.sensor_data[sensor_index] = {
                             'type': sensor_type,
@@ -221,11 +218,14 @@ class SensorApp:
                             f"Статус: {'VALID' if is_valid else 'INVALID'}"
                         )
                         
-                        # Переходим к следующему датчику
-                        self.current_sensor_index = (self.current_sensor_index + 1) % self.sensors_count
-                        
-                        # Обновляем интерфейс
+                        # Update display immediately
                         self.root.after(0, lambda idx=sensor_index: self.update_sensor_display(idx))
+                        
+                        # Request next sensor in fixed order
+                        next_idx = (self.sensor_order.index(sensor_index) + 1) % self.sensors_count
+                        self.current_sensor_index = self.sensor_order[next_idx]
+                        self.request_sensor_data(self.current_sensor_index)
+                        
                     except Exception as e:
                         self.log_message(f"Ошибка обработки данных: {str(e)}")
                     
@@ -234,89 +234,70 @@ class SensorApp:
                     
             pos += 1
 
+    def create_sensor_tabs_in_order(self):
+        """Create tabs in fixed order 0-1-2-3-4 with predefined names"""
+        if not hasattr(self, 'notebook') or self.sensors_count <= 0:
+            return
+            
+        # Remove old tabs
+        for tab in self.notebook.tabs()[1:]:
+            self.notebook.forget(tab)
+        
+        self.sensor_widgets = {}
+        
+        # Create tabs in fixed order
+        for i in range(self.sensors_count):
+            tab = ttk.Frame(self.notebook)
+            
+            # Use predefined name if available
+            tab_name = self.sensor_names[i] if i < len(self.sensor_names) else f"Датчик {i}"
+            self.notebook.add(tab, text=tab_name)
+            
+            # Header
+            ttk.Label(tab, text=f"Данные {tab_name}", 
+                    font=('Arial', 12, 'bold')).pack(pady=5)
+            
+            self.create_sensor_display(tab, i)
+            ttk.Button(tab, text="Обновить",
+                    command=lambda idx=i: self.update_single_sensor(idx)).pack(pady=5)
+            
+            # Request data immediately
+            self.request_sensor_data(i)
+
     def get_sensor_type_name(self, type_code):
         sensor_types = {
             0: "UNDEFINED",
             1: "TEMPERATURE",
-            2: "HUMIDITY",
-            3: "HUMIDITY",  # Для второго датчика влажности
+            2: "PRESSURE",
+            3: "HUMIDITY",
             4: "DUST",
             5: "COUNT"
         }
         return sensor_types.get(type_code, f"UNKNOWN ({type_code})")
     
-    def update_sensor_tabs(self):
-        """Создает вкладки для датчиков с правильными кнопками обновления"""
-        if not hasattr(self, 'notebook') or self.sensors_count <= 0:
-            return
-            
-        # Удаляем старые вкладки
-        for tab in self.notebook.tabs()[1:]:
-            self.notebook.forget(tab)
-        
-        # Создаем словарь для виджетов
-        self.sensor_widgets = {}
-        
-        # Создаем вкладки для каждого датчика с правильными названиями
-        sensor_names = [
-            "Датчик Dust",
-            "Датчик Temp 1",
-            "Датчик Humid 1",
-            "Датчик Temp 2",
-            "Датчик Humid 2"
-        ]
-        
-        for i in range(self.sensors_count):
-            tab = ttk.Frame(self.notebook)
-            # Используем правильное имя для вкладки
-            tab_name = sensor_names[i] if i < len(sensor_names) else f"Датчик {i}"
-            self.notebook.add(tab, text=tab_name)
-            
-            # Заголовок
-            ttk.Label(tab, text=f"Данные {tab_name}", 
-                    font=('Arial', 12, 'bold')).pack(pady=5)
-            
-            # Виджеты данных
-            self.create_sensor_display(tab, i)
-            
-            # Кнопка обновления с фиксированным индексом через lambda
-            ttk.Button(tab, text="Обновить",
-                    command=lambda idx=i: self.update_single_sensor(idx)).pack(pady=5)
-            
-            # Первоначальный запрос данных
-            self.request_sensor_data(i)
-
     def update_single_sensor(self, sensor_index):
-        """Обновляет данные только для одного датчика"""
         if 0 <= sensor_index < self.sensors_count:
-            # Сохраняем текущий индекс
             prev_index = self.current_sensor_index
-            # Устанавливаем нужный индекс
             self.current_sensor_index = sensor_index
-            # Делаем запрос
             self.request_sensor_data(sensor_index)
-            # Восстанавливаем индекс (если нужно)
             self.current_sensor_index = prev_index
-            # Логируем действие
             self.log_message(f"Ручной запрос данных датчика {sensor_index}")
    
     def get_sensor_units(self, type_code):
-        """Возвращает единицы измерения для типа датчика"""
         units = {
-            0: "",          # UNDEFINED
-            1: "°C",        # TEMPERATURE
-            2: "kPa",       # PRESSURE
-            3: "%",         # HUMIDITY
-            4: "μg/m³",     # DUST
-            5: ""           # COUNT
+            0: "",
+            1: "°C",
+            2: "kPa",
+            3: "%",
+            4: "μg/m³",
+            5: ""
         }
         return units.get(type_code, "")
 
     def calculate_processed_value(self, data):
-        """Вычисляет итоговое значение по формуле (value/gain) - offset"""
         try:
             if data['gain'] == 0:
-                return 0  # Защита от деления на ноль
+                return 0
             return (data['value'] / data['gain']) - data['offset']
         except:
             return 0   
@@ -327,13 +308,12 @@ class SensorApp:
         
         sensor_widgets = {}
         
-        # Обновленный список полей с добавлением расчетного значения
         labels_info = [
             ("Тип:", 'type'),
             ("Сырое значение:", 'value'),
             ("Усиление:", 'gain'),
             ("Смещение:", 'offset'),
-            ("Результат:", 'processed'),  # Новое поле
+            ("Результат:", 'processed'),
             ("Статус:", 'status')
         ]
         
@@ -345,23 +325,18 @@ class SensorApp:
         self.sensor_widgets[sensor_index] = sensor_widgets
     
     def update_sensor_display(self, sensor_index):
-        """Обновляет отображение конкретного датчика с расчетными значениями"""
         if sensor_index in self.sensor_widgets and sensor_index in self.sensor_data:
             widgets = self.sensor_widgets[sensor_index]
             data = self.sensor_data[sensor_index]
             
-            # Получаем единицы измерения
             units = self.get_sensor_units(data['type'])
-            
-            # Рассчитываем итоговое значение
             processed_value = self.calculate_processed_value(data)
             
-            # Обновляем виджеты
-            widgets['type'].config(text=f"{self.get_sensor_type_name(data['type'])}")
+            widgets['type'].config(text=self.get_sensor_type_name(data['type']))
             widgets['value'].config(text=f"{data['value']} (raw)")
             widgets['gain'].config(text=f"{data['gain']}")
             widgets['offset'].config(text=f"{data['offset']}")
-            widgets['processed'].config(text=f"{processed_value:.2f} {units}")  # Новый виджет для расчетного значения
+            widgets['processed'].config(text=f"{processed_value:.2f} {units}")
             widgets['status'].config(
                 text="VALID" if data['is_valid'] else "INVALID",
                 fg="green" if data['is_valid'] else "red"
