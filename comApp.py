@@ -8,7 +8,12 @@ import time
 class SensorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("UART Sensor Monitor")
+        self.root.title("KOSTVT UART Monitor")
+        
+            # Фиксируем размер окна
+        self.root.geometry("700x400")  # Ширина x Высота
+        self.root.minsize(700, 400)    # Минимальный размер
+        self.root.maxsize(700, 400)    # Максимальный размер
         
         # Serial communication
         self.serial_port = None
@@ -16,21 +21,11 @@ class SensorApp:
         self.sensor_data = {}
         self.sensor_widgets = {}
         
-        # Sensor order and polling
-        self.sensor_order = []
+        # Sensor polling
         self.current_sensor_index = 0
-        self.polling_interval = 1000  # 1 second between sensor polls
+        self.polling_interval = 200  # 200ms between sensor polls
         self.polling_active = False
         self.connected = False
-        
-        # Fixed sensor names and types
-        self.sensor_info = [
-            {"name": "Датчик Dust", "type": 4, "unit": "μg/m³"},
-            {"name": "Датчик Temp 1", "type": 1, "unit": "°C"},
-            {"name": "Датчик Humid 1", "type": 3, "unit": "%"},
-            {"name": "Датчик Temp 2", "type": 1, "unit": "°C"},
-            {"name": "Датчик Humid 2", "type": 3, "unit": "%"}
-        ]
         
         self.create_widgets()
         self.update_ports_list()
@@ -185,11 +180,6 @@ class SensorApp:
             self.log_message("Отправлен запрос количества датчиков: 41 41 02 00 01")
     
     def request_sensor_data(self, sensor_index):
-        if not 0 <= sensor_index < self.sensors_count:
-            return
-            
-        self.current_sensor_index = sensor_index
-        
         request = bytes([0x41, 0x41, 0x04, 0x00, 0x02, 0x00, sensor_index])
         if self.send_request_with_delay(request):
             self.log_message(f"Запрос данных датчика {sensor_index} отправлен")
@@ -231,23 +221,29 @@ class SensorApp:
                     pos = message_end
                     continue
                     
-                # Sensor data response
-                if payload_len == 8 and len(data[pos:message_end]) >= 11:
+                # Sensor data response (new format with index)
+                if payload_len >= 13:  # Минимальная длина для новых данных
                     try:
-                        sensor_index = self.current_sensor_index
-                        sensor_type = data[pos+3]
+                        sensor_index = data[pos+3]  # Индекс датчика из payload
+                        sensor_type = data[pos+4]
                         
-                        value = data[pos+4] | (data[pos+5] << 8)
-                        gain = data[pos+6] | (data[pos+7] << 8)
-                        offset = data[pos+8] | (data[pos+9] << 8)
-                        is_valid = data[pos+10]
+                        value = data[pos+5] | (data[pos+6] << 8)
+                        gain = data[pos+7] | (data[pos+8] << 8)
+                        offset = data[pos+9] | (data[pos+10] << 8)
+                        is_valid = data[pos+11]
+                        location = data[pos+12]
+                        is_fault_detection = data[pos+13]
+                        fault_level = data[pos+14] | (data[pos+15] << 8)
                         
                         self.sensor_data[sensor_index] = {
                             'type': sensor_type,
                             'value': value,
                             'gain': gain,
                             'offset': offset,
-                            'is_valid': is_valid
+                            'is_valid': is_valid,
+                            'location': location,
+                            'is_fault_detection': is_fault_detection,
+                            'fault_level': fault_level
                         }
                         
                         self.log_message(
@@ -256,9 +252,13 @@ class SensorApp:
                             f"Значение: {value}\n"
                             f"Усиление: {gain}\n"
                             f"Смещение: {offset}\n"
-                            f"Статус: {'VALID' if is_valid else 'INVALID'}"
+                            f"Статус: {'VALID' if is_valid else 'INVALID'}\n"
+                            f"Расположение: {location}\n"
+                            f"Детекция ошибок: {'ON' if is_fault_detection else 'OFF'}\n"
+                            f"Уровень ошибки: {fault_level}"
                         )
                         
+                        # Update display immediately
                         self.root.after(0, lambda idx=sensor_index: self.update_sensor_display(idx))
                         
                     except Exception as e:
@@ -271,8 +271,7 @@ class SensorApp:
 
     def initialize_sensor_system(self):
         """Initialize sensor tabs and start polling"""
-        # Create tabs in fixed order
-        self.sensor_order = list(range(min(self.sensors_count, len(self.sensor_info))))
+        # Create tabs for each sensor
         self.create_sensor_tabs()
         
         # Start polling cycle
@@ -280,21 +279,21 @@ class SensorApp:
         self.poll_next_sensor()
 
     def poll_next_sensor(self):
-        """Poll next sensor in fixed order"""
+        """Poll next sensor in sequence"""
         if not self.polling_active or not self.connected or not self.serial_port.is_open:
             return
             
-        if self.sensor_order:
-            self.current_sensor_index = self.sensor_order.pop(0)
-            self.sensor_order.append(self.current_sensor_index)  # Rotate through sensors
-            
+        if self.sensors_count > 0:
             self.request_sensor_data(self.current_sensor_index)
+            
+            # Move to next sensor (circular)
+            self.current_sensor_index = (self.current_sensor_index + 1) % self.sensors_count
             
             # Schedule next poll
             self.root.after(self.polling_interval, self.poll_next_sensor)
 
     def create_sensor_tabs(self):
-        """Create tabs with fixed names and order"""
+        """Create tabs for each sensor"""
         if not hasattr(self, 'notebook'):
             return
             
@@ -304,14 +303,13 @@ class SensorApp:
         
         self.sensor_widgets = {}
         
-        # Create tabs in predefined order
-        for i in range(min(self.sensors_count, len(self.sensor_info))):
+        # Create tabs for each sensor
+        for i in range(self.sensors_count):
             tab = ttk.Frame(self.notebook)
-            tab_name = self.sensor_info[i]["name"]
-            self.notebook.add(tab, text=tab_name)
+            self.notebook.add(tab, text=f"Датчик {i}")
             
             # Header
-            ttk.Label(tab, text=f"Данные {tab_name}", 
+            ttk.Label(tab, text=f"Данные датчика {i}", 
                     font=('Arial', 12, 'bold')).pack(pady=5)
             
             self.create_sensor_display(tab, i)
@@ -326,6 +324,27 @@ class SensorApp:
             5: "COUNT"
         }
         return sensor_types.get(type_code, f"UNKNOWN ({type_code})")
+
+    def get_sensor_units(self, type_code):
+        units = {
+            0: "",
+            1: "°C",
+            2: "kPa",
+            3: "%",
+            4: "μg/m³",
+            5: ""
+        }
+        return units.get(type_code, "")
+
+    def get_location_name(self, location_code):
+        locations = {
+            0: "Не определено",
+            1: "Внутри",
+            2: "Снаружи",
+            3: "Канал 1",
+            4: "Канал 2"
+        }
+        return locations.get(location_code, f"Unknown ({location_code})")
 
     def calculate_processed_value(self, data):
         try:
@@ -343,11 +362,14 @@ class SensorApp:
         
         labels_info = [
             ("Тип:", 'type'),
+            ("Расположение:", 'location'),
             ("Сырое значение:", 'value'),
             ("Усиление:", 'gain'),
             ("Смещение:", 'offset'),
             ("Результат:", 'processed'),
-            ("Статус:", 'status')
+            ("Статус:", 'status'),
+            ("Детекция ошибок:", 'fault_detection'),
+            ("Уровень ошибки:", 'fault_level')
         ]
         
         for row, (label_text, key) in enumerate(labels_info):
@@ -362,12 +384,12 @@ class SensorApp:
             widgets = self.sensor_widgets[sensor_index]
             data = self.sensor_data[sensor_index]
             
-            # Get unit from sensor_info
-            unit = self.sensor_info[sensor_index]["unit"] if sensor_index < len(self.sensor_info) else ""
-            
+            sensor_type = data['type']
+            unit = self.get_sensor_units(sensor_type)
             processed_value = self.calculate_processed_value(data)
             
-            widgets['type'].config(text=self.get_sensor_type_name(data['type']))
+            widgets['type'].config(text=f"{self.get_sensor_type_name(sensor_type)}")
+            widgets['location'].config(text=f"{self.get_location_name(data['location'])}")
             widgets['value'].config(text=f"{data['value']} (raw)")
             widgets['gain'].config(text=f"{data['gain']}")
             widgets['offset'].config(text=f"{data['offset']}")
@@ -376,6 +398,11 @@ class SensorApp:
                 text="VALID" if data['is_valid'] else "INVALID",
                 fg="green" if data['is_valid'] else "red"
             )
+            widgets['fault_detection'].config(
+                text="ON" if data['is_fault_detection'] else "OFF",
+                fg="red" if data['is_fault_detection'] else "black"
+            )
+            widgets['fault_level'].config(text=f"{data['fault_level']}")
     
     def update_data(self):
         if hasattr(self, 'sensor_widgets'):
