@@ -10,18 +10,26 @@ class SensorApp:
         self.root = root
         self.root.title("UART Sensor Monitor")
         
+        # Serial communication
         self.serial_port = None
         self.sensors_count = 0
         self.sensor_data = {}
         self.sensor_widgets = {}
-        self.current_sensor_index = 0
+        
+        # Sensor order and polling
         self.sensor_order = []
-        self.sensor_names = [
-            "Датчик Dust",
-            "Датчик Temp 1",
-            "Датчик Humid 1",
-            "Датчик Temp 2",
-            "Датчик Humid 2"
+        self.current_sensor_index = 0
+        self.polling_interval = 1000  # 1 second between sensor polls
+        self.polling_active = False
+        self.connected = False
+        
+        # Fixed sensor names and types
+        self.sensor_info = [
+            {"name": "Датчик Dust", "type": 4, "unit": "μg/m³"},
+            {"name": "Датчик Temp 1", "type": 1, "unit": "°C"},
+            {"name": "Датчик Humid 1", "type": 3, "unit": "%"},
+            {"name": "Датчик Temp 2", "type": 1, "unit": "°C"},
+            {"name": "Датчик Humid 2", "type": 3, "unit": "%"}
         ]
         
         self.create_widgets()
@@ -30,8 +38,6 @@ class SensorApp:
         self.running = True
         self.read_thread = Thread(target=self.read_serial_data, daemon=True)
         self.read_thread.start()
-        
-        self.update_data()
 
     def create_widgets(self):
         # Control panel
@@ -46,6 +52,10 @@ class SensorApp:
         
         self.connect_btn = tk.Button(control_frame, text="Подключиться", command=self.connect_to_port)
         self.connect_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.disconnect_btn = tk.Button(control_frame, text="Закрыть порт", 
+                                      command=self.disconnect_port, state=tk.DISABLED)
+        self.disconnect_btn.pack(side=tk.LEFT, padx=5)
         
         self.refresh_btn = tk.Button(control_frame, text="Обновить список", command=self.update_ports_list)
         self.refresh_btn.pack(side=tk.LEFT)
@@ -112,14 +122,46 @@ class SensorApp:
             
         try:
             self.serial_port = serial.Serial(port_name, baudrate=9600, timeout=1)
+            self.connected = True
             self.status_label.config(text=f"Статус: Подключено к {port_name}")
             self.log_message(f"Успешное подключение к {port_name}")
+            
+            # Update UI
+            self.connect_btn.config(state=tk.DISABLED)
+            self.disconnect_btn.config(state=tk.NORMAL)
+            self.port_combobox.config(state='disabled')
+            
+            # Start communication
             self.request_sensor_count()
+            
         except Exception as e:
             self.status_label.config(text="Статус: Ошибка подключения")
             self.log_message(f"Ошибка подключения к {port_name}: {str(e)}")
             messagebox.showerror("Ошибка", f"Не удалось подключиться к {port_name}:\n{str(e)}")
-    
+
+    def disconnect_port(self):
+        """Close serial port and stop polling"""
+        self.polling_active = False
+        self.connected = False
+        
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.close()
+            self.log_message("COM порт закрыт")
+        
+        self.status_label.config(text="Статус: Не подключено")
+        self.connect_btn.config(state=tk.NORMAL)
+        self.disconnect_btn.config(state=tk.DISABLED)
+        self.port_combobox.config(state='readonly')
+
+        # Clear sensor data
+        self.sensor_data = {}
+        self.sensors_count = 0
+        self.current_sensor_index = 0
+        
+        # Remove all sensor tabs
+        for tab in self.notebook.tabs()[1:]:
+            self.notebook.forget(tab)
+
     def log_message(self, message):
         self.system_text.config(state=tk.NORMAL)
         self.system_text.insert(tk.END, message + "\n")
@@ -185,8 +227,7 @@ class SensorApp:
                 if payload_len == 1:
                     self.sensors_count = data[pos+3]
                     self.log_message(f"Получено количество датчиков: {self.sensors_count}")
-                    self.sensor_order = list(range(self.sensors_count))
-                    self.root.after(0, self.create_sensor_tabs_in_order)
+                    self.initialize_sensor_system()
                     pos = message_end
                     continue
                     
@@ -218,13 +259,7 @@ class SensorApp:
                             f"Статус: {'VALID' if is_valid else 'INVALID'}"
                         )
                         
-                        # Update display immediately
                         self.root.after(0, lambda idx=sensor_index: self.update_sensor_display(idx))
-                        
-                        # Request next sensor in fixed order
-                        next_idx = (self.sensor_order.index(sensor_index) + 1) % self.sensors_count
-                        self.current_sensor_index = self.sensor_order[next_idx]
-                        self.request_sensor_data(self.current_sensor_index)
                         
                     except Exception as e:
                         self.log_message(f"Ошибка обработки данных: {str(e)}")
@@ -234,9 +269,33 @@ class SensorApp:
                     
             pos += 1
 
-    def create_sensor_tabs_in_order(self):
-        """Create tabs in fixed order 0-1-2-3-4 with predefined names"""
-        if not hasattr(self, 'notebook') or self.sensors_count <= 0:
+    def initialize_sensor_system(self):
+        """Initialize sensor tabs and start polling"""
+        # Create tabs in fixed order
+        self.sensor_order = list(range(min(self.sensors_count, len(self.sensor_info))))
+        self.create_sensor_tabs()
+        
+        # Start polling cycle
+        self.polling_active = True
+        self.poll_next_sensor()
+
+    def poll_next_sensor(self):
+        """Poll next sensor in fixed order"""
+        if not self.polling_active or not self.connected or not self.serial_port.is_open:
+            return
+            
+        if self.sensor_order:
+            self.current_sensor_index = self.sensor_order.pop(0)
+            self.sensor_order.append(self.current_sensor_index)  # Rotate through sensors
+            
+            self.request_sensor_data(self.current_sensor_index)
+            
+            # Schedule next poll
+            self.root.after(self.polling_interval, self.poll_next_sensor)
+
+    def create_sensor_tabs(self):
+        """Create tabs with fixed names and order"""
+        if not hasattr(self, 'notebook'):
             return
             
         # Remove old tabs
@@ -245,12 +304,10 @@ class SensorApp:
         
         self.sensor_widgets = {}
         
-        # Create tabs in fixed order
-        for i in range(self.sensors_count):
+        # Create tabs in predefined order
+        for i in range(min(self.sensors_count, len(self.sensor_info))):
             tab = ttk.Frame(self.notebook)
-            
-            # Use predefined name if available
-            tab_name = self.sensor_names[i] if i < len(self.sensor_names) else f"Датчик {i}"
+            tab_name = self.sensor_info[i]["name"]
             self.notebook.add(tab, text=tab_name)
             
             # Header
@@ -258,11 +315,6 @@ class SensorApp:
                     font=('Arial', 12, 'bold')).pack(pady=5)
             
             self.create_sensor_display(tab, i)
-            ttk.Button(tab, text="Обновить",
-                    command=lambda idx=i: self.update_single_sensor(idx)).pack(pady=5)
-            
-            # Request data immediately
-            self.request_sensor_data(i)
 
     def get_sensor_type_name(self, type_code):
         sensor_types = {
@@ -274,25 +326,6 @@ class SensorApp:
             5: "COUNT"
         }
         return sensor_types.get(type_code, f"UNKNOWN ({type_code})")
-    
-    def update_single_sensor(self, sensor_index):
-        if 0 <= sensor_index < self.sensors_count:
-            prev_index = self.current_sensor_index
-            self.current_sensor_index = sensor_index
-            self.request_sensor_data(sensor_index)
-            self.current_sensor_index = prev_index
-            self.log_message(f"Ручной запрос данных датчика {sensor_index}")
-   
-    def get_sensor_units(self, type_code):
-        units = {
-            0: "",
-            1: "°C",
-            2: "kPa",
-            3: "%",
-            4: "μg/m³",
-            5: ""
-        }
-        return units.get(type_code, "")
 
     def calculate_processed_value(self, data):
         try:
@@ -329,14 +362,16 @@ class SensorApp:
             widgets = self.sensor_widgets[sensor_index]
             data = self.sensor_data[sensor_index]
             
-            units = self.get_sensor_units(data['type'])
+            # Get unit from sensor_info
+            unit = self.sensor_info[sensor_index]["unit"] if sensor_index < len(self.sensor_info) else ""
+            
             processed_value = self.calculate_processed_value(data)
             
             widgets['type'].config(text=self.get_sensor_type_name(data['type']))
             widgets['value'].config(text=f"{data['value']} (raw)")
             widgets['gain'].config(text=f"{data['gain']}")
             widgets['offset'].config(text=f"{data['offset']}")
-            widgets['processed'].config(text=f"{processed_value:.2f} {units}")
+            widgets['processed'].config(text=f"{processed_value:.2f} {unit}")
             widgets['status'].config(
                 text="VALID" if data['is_valid'] else "INVALID",
                 fg="green" if data['is_valid'] else "red"
@@ -351,6 +386,8 @@ class SensorApp:
         self.root.after(500, self.update_data)
     
     def on_closing(self):
+        """Cleanup on window close"""
+        self.polling_active = False
         self.running = False
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
