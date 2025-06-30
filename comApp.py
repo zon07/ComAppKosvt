@@ -10,10 +10,10 @@ class SensorApp:
         self.root = root
         self.root.title("KOSTVT UART Monitor")
         
-            # Фиксируем размер окна
-        self.root.geometry("700x400")  # Ширина x Высота
-        self.root.minsize(700, 400)    # Минимальный размер
-        self.root.maxsize(700, 400)    # Максимальный размер
+        # Фиксируем размер окна
+        self.root.geometry("700x450")  # Ширина x Высота (увеличено для Alive индикатора)
+        self.root.minsize(700, 450)
+        self.root.maxsize(700, 450)
         
         # Serial communication
         self.serial_port = None
@@ -27,12 +27,24 @@ class SensorApp:
         self.polling_active = False
         self.connected = False
         
+        # Alive monitoring
+        self.last_alive_time = 0
+        self.alive_timeout = 3000  # 3 seconds timeout
+        self.alive_check_interval = 1000  # Check every 1 second
+        
+        # Log buffer settings
+        self.max_log_lines = 1000  # Максимальное количество строк в логе
+        self.log_buffer_size = 100  # Количество строк для удаления при переполнении
+        
         self.create_widgets()
         self.update_ports_list()
         
         self.running = True
         self.read_thread = Thread(target=self.read_serial_data, daemon=True)
         self.read_thread.start()
+        
+        # Start alive monitoring
+        self.root.after(self.alive_check_interval, self.check_alive_status)
 
     def create_widgets(self):
         # Main container frame
@@ -67,7 +79,11 @@ class SensorApp:
         status_frame.pack(fill=tk.X, pady=2)
         
         self.status_label = tk.Label(status_frame, text="Статус: Не подключено", anchor='w')
-        self.status_label.pack(fill=tk.X)
+        self.status_label.pack(side=tk.LEFT)
+        
+        # Alive status indicator
+        self.alive_status = tk.Label(status_frame, text="[ALIVE: ---]", fg="gray")
+        self.alive_status.pack(side=tk.RIGHT)
         
         # Notebook (tabs)
         self.notebook = ttk.Notebook(main_frame)
@@ -87,6 +103,43 @@ class SensorApp:
         self.context_menu.add_command(label="Копировать", command=self.copy_from_log)
         self.context_menu.add_command(label="Очистить лог", command=self.clear_log)
         self.system_text.bind("<Button-3>", self.show_context_menu)
+
+    def check_alive_status(self):
+        """Check if device is still alive (responding)"""
+        if self.connected and self.serial_port and self.serial_port.is_open:
+            current_time = time.time() * 1000  # Convert to milliseconds
+            time_diff = current_time - self.last_alive_time
+            
+            if time_diff > self.alive_timeout:
+                # Device is not responding
+                self.alive_status.config(text="[ALIVE: NO RESPONSE]", fg="red")
+                self.log_message("Ошибка: Устройство не отвечает (Alive timeout)")
+                self.reset_sensor_values()  # Сбрасываем значения датчиков
+            else:
+                # Device is responding
+                self.alive_status.config(text="[ALIVE: OK]", fg="green")
+        
+        self.root.after(self.alive_check_interval, self.check_alive_status)
+
+    def reset_sensor_values(self):
+        """Reset all sensor values to default/undefined state"""
+        for sensor_index in self.sensor_widgets:
+            widgets = self.sensor_widgets[sensor_index]
+            
+            # Обновляем все виджеты на вкладках датчиков
+            widgets['type'].config(text="---")
+            widgets['location'].config(text="---")
+            widgets['value'].config(text="---")
+            widgets['gain'].config(text="---")
+            widgets['offset'].config(text="---")
+            widgets['processed'].config(text="---")
+            widgets['status'].config(text="---", fg="black")
+            widgets['fault_detection'].config(text="---", fg="black")
+            widgets['fault_level'].config(text="---")
+        
+        # Также очищаем данные в памяти
+        self.sensor_data = {}
+        self.log_message("Значения датчиков сброшены из-за потери связи")
 
     def show_context_menu(self, event):
         try:
@@ -118,24 +171,39 @@ class SensorApp:
             self.status_label.config(text="Статус: COM-порты не найдены")
     
     def connect_to_port(self):
+        # Добавляем небольшую задержку перед повторным подключением
+        time.sleep(0.5)
+        
         port_name = self.port_combobox.get()
         if not port_name:
             messagebox.showerror("Ошибка", "Не выбран COM-порт")
             return
             
-        if self.serial_port and self.serial_port.is_open:
-            self.serial_port.close()
-            
+        if self.serial_port and hasattr(self.serial_port, 'is_open'):
+            try:
+                self.serial_port.close()
+            except:
+                pass
+                
         try:
+            # Создаем новый экземпляр Serial вместо повторного использования старого
             self.serial_port = serial.Serial(port_name, baudrate=9600, timeout=1)
             self.connected = True
+            self.running = True  # Убедимся, что флаг running установлен
+            self.last_alive_time = time.time() * 1000  # Initialize alive timer
             self.status_label.config(text=f"Статус: Подключено к {port_name}")
+            self.alive_status.config(text="[ALIVE: ---]", fg="gray")
             self.log_message(f"Успешное подключение к {port_name}")
             
             # Update UI
             self.connect_btn.config(state=tk.DISABLED)
             self.disconnect_btn.config(state=tk.NORMAL)
             self.port_combobox.config(state='disabled')
+            
+            # Перезапускаем поток чтения, если он завершился
+            if not self.read_thread.is_alive():
+                self.read_thread = Thread(target=self.read_serial_data, daemon=True)
+                self.read_thread.start()
             
             # Start communication
             self.request_sensor_count()
@@ -150,26 +218,49 @@ class SensorApp:
         self.polling_active = False
         self.connected = False
         
-        if self.serial_port and self.serial_port.is_open:
-            self.serial_port.close()
-            self.log_message("COM порт закрыт")
+        # Останавливаем поток чтения
+        self.running = False
         
+        # Даем время потоку завершиться
+        time.sleep(0.1)
+        
+        try:
+            if self.serial_port and hasattr(self.serial_port, 'is_open'):
+                # Очищаем буферы перед закрытием
+                self.serial_port.reset_input_buffer()
+                self.serial_port.reset_output_buffer()
+                self.serial_port.close()
+                self.log_message("COM порт закрыт")
+        except Exception as e:
+            self.log_message(f"Ошибка при закрытии порта: {str(e)}")
+        
+        # Обновляем интерфейс
         self.status_label.config(text="Статус: Не подключено")
+        self.alive_status.config(text="[ALIVE: ---]", fg="gray")
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
         self.port_combobox.config(state='readonly')
 
-        # Clear sensor data
+        # Очищаем данные
         self.sensor_data = {}
         self.sensors_count = 0
         self.current_sensor_index = 0
         
-        # Remove all sensor tabs
+        # Удаляем вкладки датчиков
         for tab in self.notebook.tabs()[1:]:
             self.notebook.forget(tab)
 
     def log_message(self, message):
         self.system_text.config(state=tk.NORMAL)
+        
+        # Проверяем, не превышен ли лимит строк
+        line_count = int(self.system_text.index('end-1c').split('.')[0])
+        if line_count >= self.max_log_lines:
+            # Удаляем старые 10% сообщений
+            delete_lines = min(self.log_buffer_size, line_count)
+            self.system_text.delete(1.0, f"{delete_lines}.0")
+            self.system_text.insert(tk.END, f"... удалено {delete_lines} старых строк ...\n")
+        
         self.system_text.insert(tk.END, message + "\n")
         self.system_text.see(tk.END)
         self.system_text.config(state=tk.DISABLED)
@@ -186,28 +277,44 @@ class SensorApp:
         return True
     
     def request_sensor_count(self):
-        request = bytes([0x41, 0x41, 0x02, 0x00, 0x01])
+        # New protocol format: 0x41 0x41 <len> <cmd_lsb> <cmd_msb> <params...>
+        request = bytes([0x41, 0x41, 0x02, 0x02, 0x00])  # GET_SENSORS_COUNT = 0x0002
         if self.send_request_with_delay(request):
-            self.log_message("Отправлен запрос количества датчиков: 41 41 02 00 01")
+            self.log_message("Отправлен запрос количества датчиков: 41 41 02 02 00")
     
     def request_sensor_data(self, sensor_index):
-        request = bytes([0x41, 0x41, 0x04, 0x00, 0x02, 0x00, sensor_index])
+        # New protocol format: 0x41 0x41 <len> <cmd_lsb> <cmd_msb> <params...>
+        # GET_SENSOR_DATA = 0x0003, параметр - индекс датчика (2 байта)
+        request = bytes([
+            0x41, 0x41,  # Header
+            0x04,         # Length (cmd + param)
+            0x03, 0x00,   # GET_SENSOR_DATA (0x0003)
+            (sensor_index & 0xFF), ((sensor_index >> 8) & 0xFF)  # Sensor index (2 bytes)
+        ])
         if self.send_request_with_delay(request):
             self.log_message(f"Запрос данных датчика {sensor_index} отправлен")
     
     def read_serial_data(self):
         while self.running:
             try:
-                if not self.serial_port or not self.serial_port.is_open:
+                # Проверяем, что порт существует и открыт
+                if not self.serial_port or not hasattr(self.serial_port, 'is_open') or not self.serial_port.is_open:
                     time.sleep(1)
                     continue
                     
-                if self.serial_port.in_waiting > 0:
-                    data = self.serial_port.read(self.serial_port.in_waiting)
-                    self.process_received_data(data)
+                try:
+                    # Безопасная проверка наличия данных
+                    if self.serial_port.in_waiting > 0:
+                        data = self.serial_port.read(self.serial_port.in_waiting)
+                        self.process_received_data(data)
+                except (serial.SerialException, OSError) as e:
+                    if self.running:  # Логируем только если не было запроса на закрытие
+                        self.log_message(f"Ошибка чтения порта: {str(e)}")
+                    time.sleep(1)
                     
             except Exception as e:
-                self.log_message(f"Ошибка в потоке чтения: {str(e)}")
+                if self.running:  # Логируем только если не было запроса на закрытие
+                    self.log_message(f"Ошибка в потоке чтения: {str(e)}")
                 time.sleep(1)
                 
             time.sleep(0.1)
@@ -216,65 +323,77 @@ class SensorApp:
         self.log_message(f"Получены данные: {data.hex(' ')}")
         
         pos = 0
-        while pos <= len(data) - 4:
+        while pos <= len(data) - 4:  # Минимум 4 байта (заголовок + длина)
             if data[pos] == 0x41 and data[pos+1] == 0x41:
                 payload_len = data[pos+2]
                 message_end = pos + 3 + payload_len
                 
                 if message_end > len(data):
+                    self.log_message(f"Неполное сообщение, ожидается {payload_len} байт")
                     break
                     
-                # Sensor count response
-                if payload_len == 1:
-                    self.sensors_count = data[pos+3]
+                cmd_code = data[pos+3] | (data[pos+4] << 8)
+                self.last_alive_time = time.time() * 1000
+                
+                # Обработка ответа с количеством датчиков (0x0002)
+                if cmd_code == 0x0002 and payload_len >= 1:
+                    self.sensors_count = data[pos+5]
                     self.log_message(f"Получено количество датчиков: {self.sensors_count}")
                     self.initialize_sensor_system()
                     pos = message_end
                     continue
                     
-                # Sensor data response (new format with index)
-                if payload_len >= 13:  # Минимальная длина для новых данных
+                # Обработка данных датчика (0x0003)
+                if cmd_code == 0x0003 and payload_len >= 13:
                     try:
-                        sensor_index = data[pos+3]  # Индекс датчика из payload
-                        sensor_type = data[pos+4]
+                        # Проверяем, что в сообщении достаточно данных (3 заголовок + 13 payload)
+                        if len(data) >= pos + 16:
+                            sensor_index = data[pos+5] | (data[pos+6] << 8)
+                            sensor_type = data[pos+7]
+                            
+                            value = data[pos+8] | (data[pos+9] << 8)
+                            gain = data[pos+10] | (data[pos+11] << 8)
+                            offset = data[pos+12] | (data[pos+13] << 8)
+                            is_valid = data[pos+14]
+                            location = data[pos+15]
+                            is_fault_detection = data[pos+16]
+                            fault_level = data[pos+17] | (data[pos+18] << 8)
+                            
+                            self.sensor_data[sensor_index] = {
+                                'type': sensor_type,
+                                'value': value,
+                                'gain': gain,
+                                'offset': offset,
+                                'is_valid': is_valid,
+                                'location': location,
+                                'is_fault_detection': is_fault_detection,
+                                'fault_level': fault_level
+                            }
+                            
+                            self.log_message(
+                                f"Данные датчика {sensor_index}:\n"
+                                f"Тип: {self.get_sensor_type_name(sensor_type)}\n"
+                                f"Значение: {value}\n"
+                                f"Усиление: {gain}\n"
+                                f"Смещение: {offset}\n"
+                                f"Статус: {'VALID' if is_valid else 'INVALID'}\n"
+                                f"Расположение: {location}\n"
+                                f"Детекция ошибок: {'ON' if is_fault_detection else 'OFF'}\n"
+                                f"Уровень ошибки: {fault_level}"
+                            )
+                            
+                            self.root.after(0, lambda idx=sensor_index: self.update_sensor_display(idx))
+                        else:
+                            self.log_message("Ошибка: Недостаточно данных в сообщении датчика")
+                    except IndexError as e:
+                        self.log_message(f"Ошибка обработки данных датчика: {str(e)}")
+                    finally:
+                        pos = message_end
+                        continue
                         
-                        value = data[pos+5] | (data[pos+6] << 8)
-                        gain = data[pos+7] | (data[pos+8] << 8)
-                        offset = data[pos+9] | (data[pos+10] << 8)
-                        is_valid = data[pos+11]
-                        location = data[pos+12]
-                        is_fault_detection = data[pos+13]
-                        fault_level = data[pos+14] | (data[pos+15] << 8)
-                        
-                        self.sensor_data[sensor_index] = {
-                            'type': sensor_type,
-                            'value': value,
-                            'gain': gain,
-                            'offset': offset,
-                            'is_valid': is_valid,
-                            'location': location,
-                            'is_fault_detection': is_fault_detection,
-                            'fault_level': fault_level
-                        }
-                        
-                        self.log_message(
-                            f"Данные датчика {sensor_index}:\n"
-                            f"Тип: {self.get_sensor_type_name(sensor_type)}\n"
-                            f"Значение: {value}\n"
-                            f"Усиление: {gain}\n"
-                            f"Смещение: {offset}\n"
-                            f"Статус: {'VALID' if is_valid else 'INVALID'}\n"
-                            f"Расположение: {location}\n"
-                            f"Детекция ошибок: {'ON' if is_fault_detection else 'OFF'}\n"
-                            f"Уровень ошибки: {fault_level}"
-                        )
-                        
-                        # Update display immediately
-                        self.root.after(0, lambda idx=sensor_index: self.update_sensor_display(idx))
-                        
-                    except Exception as e:
-                        self.log_message(f"Ошибка обработки данных: {str(e)}")
-                    
+                # Обработка Alive-сообщения (0x0001)
+                if cmd_code == 0x0001:
+                    self.log_message("Получен Alive ответ от устройства")
                     pos = message_end
                     continue
                     
@@ -349,13 +468,17 @@ class SensorApp:
 
     def get_location_name(self, location_code):
         locations = {
-            0: "Не определено",
-            1: "Внутри",
-            2: "Снаружи",
-            3: "Канал 1",
-            4: "Канал 2"
+            0: "SENSOR_LOCATION_UNDEF",
+            1: "SENSOR_LOCATION_1",
+            2: "SENSOR_LOCATION_2",
+            3: "SENSOR_LOCATION_3",
+            4: "SENSOR_LOCATION_4",
+            5: "SENSOR_LOCATION_5",
+            6: "SENSOR_LOCATION_6",
+            7: "SENSOR_LOCATION_7",
+            8: "SENSOR_LOCATION_COUNT"
         }
-        return locations.get(location_code, f"Unknown ({location_code})")
+        return locations.get(location_code, f"UNKNOWN_LOCATION ({location_code})")
 
     def calculate_processed_value(self, data):
         try:
