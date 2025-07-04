@@ -522,6 +522,17 @@ class SensorApp:
             unit = self.get_sensor_units(sensor_type)
             processed_value = self.calculate_processed_value(data)
             
+            # Обработка fault_level
+            if data['fault_level'] == 0xFFFF:
+                fault_level_text = "---"
+            else:
+                processed_fault_level = self.calculate_processed_value({
+                    'value': data['fault_level'],
+                    'gain': data['gain'],
+                    'offset': data['offset']
+                })
+                fault_level_text = f"{processed_fault_level:.2f} {unit}"
+            
             widgets['type'].config(text=f"{self.get_sensor_type_name(sensor_type)}")
             widgets['location'].config(text=f"{self.get_location_name(data['location'])}")
             widgets['value'].config(text=f"{data['value']} (raw)")
@@ -534,9 +545,9 @@ class SensorApp:
             )
             widgets['fault_detection'].config(
                 text="ON" if data['is_fault_detection'] else "OFF",
-                fg="red" if data['is_fault_detection'] else "black"
+                fg="green" if data['is_fault_detection'] else "red"
             )
-            widgets['fault_level'].config(text=f"{data['fault_level']}")
+            widgets['fault_level'].config(text=fault_level_text)
     
     def update_data(self):
         if hasattr(self, 'sensor_widgets'):
