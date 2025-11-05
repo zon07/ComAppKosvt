@@ -11,9 +11,9 @@ class SensorApp:
         self.root.title("KOSTVT UART Monitor")
         
         # Фиксируем размер окна
-        self.root.geometry("700x450")  # Ширина x Высота (увеличено для Alive индикатора)
-        self.root.minsize(700, 450)
-        self.root.maxsize(700, 450)
+        self.root.geometry("700x500")
+        self.root.minsize(700, 500)
+        self.root.maxsize(700, 500)
         
         # Serial communication
         self.serial_port = None
@@ -23,18 +23,28 @@ class SensorApp:
         
         # Sensor polling
         self.current_sensor_index = 0
-        self.polling_interval = 200  # 200ms between sensor polls
+        self.polling_interval = 200
         self.polling_active = False
         self.connected = False
         
         # Alive monitoring
         self.last_alive_time = 0
-        self.alive_timeout = 3000  # 3 seconds timeout
-        self.alive_check_interval = 1000  # Check every 1 second
+        self.alive_timeout = 3000
+        self.alive_check_interval = 1000
         
         # Log buffer settings
-        self.max_log_lines = 1000  # Максимальное количество строк в логе
-        self.log_buffer_size = 100  # Количество строк для удаления при переполнении
+        self.max_log_lines = 1000
+        self.log_buffer_size = 100
+        
+        # Режимы работы устройства
+        self.device_modes = {
+            0: "NORMAL_0",
+            1: "NORMAL_1", 
+            2: "CALIBRATION",
+            3: "SAFE",
+            4: "FACTORY_TEST"
+        }
+        self.current_mode = 0
         
         self.create_widgets()
         self.update_ports_list()
@@ -43,19 +53,16 @@ class SensorApp:
         self.read_thread = Thread(target=self.read_serial_data, daemon=True)
         self.read_thread.start()
         
-        # Start alive monitoring
         self.root.after(self.alive_check_interval, self.check_alive_status)
 
     def create_widgets(self):
-        # Main container frame
         main_frame = tk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Control panel - вертикальное расположение
         control_frame = tk.Frame(main_frame)
         control_frame.pack(fill=tk.X, pady=5)
         
-        # COM port selection - первая строка
+        # COM port selection
         com_frame = tk.Frame(control_frame)
         com_frame.pack(fill=tk.X, pady=2)
         
@@ -74,14 +81,35 @@ class SensorApp:
         self.refresh_btn = tk.Button(com_frame, text="Обновить список", command=self.update_ports_list)
         self.refresh_btn.pack(side=tk.LEFT)
         
-        # Status label - вторая строка (под COM портом)
+        # Mode control
+        mode_frame = tk.Frame(control_frame)
+        mode_frame.pack(fill=tk.X, pady=2)
+        
+        tk.Label(mode_frame, text="Режим:").pack(side=tk.LEFT)
+        
+        self.mode_combobox = ttk.Combobox(mode_frame, values=list(self.device_modes.values()), 
+                                         state="readonly", width=12)
+        self.mode_combobox.set("NORMAL_0")  # Значение по умолчанию
+        self.mode_combobox.pack(side=tk.LEFT, padx=5)
+        
+        self.set_mode_btn = tk.Button(mode_frame, text="Установить режим", 
+                                    command=self.set_device_mode, state=tk.DISABLED)
+        self.set_mode_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.get_mode_btn = tk.Button(mode_frame, text="Получить режим",
+                                    command=self.get_device_mode, state=tk.DISABLED)
+        self.get_mode_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.mode_status_label = tk.Label(mode_frame, text="Текущий: ---", fg="blue")
+        self.mode_status_label.pack(side=tk.LEFT, padx=10)
+        
+        # Status label
         status_frame = tk.Frame(control_frame)
         status_frame.pack(fill=tk.X, pady=2)
         
         self.status_label = tk.Label(status_frame, text="Статус: Не подключено", anchor='w')
         self.status_label.pack(side=tk.LEFT)
         
-        # Alive status indicator
         self.alive_status = tk.Label(status_frame, text="[ALIVE: ---]", fg="gray")
         self.alive_status.pack(side=tk.RIGHT)
         
@@ -104,29 +132,105 @@ class SensorApp:
         self.context_menu.add_command(label="Очистить лог", command=self.clear_log)
         self.system_text.bind("<Button-3>", self.show_context_menu)
 
+    def update_mode_combobox(self, mode_value):
+        """Обновление combobox в соответствии с текущим режимом устройства"""
+        mode_name = self.device_modes.get(mode_value, "UNKNOWN")
+        
+        # Обновляем combobox только если значение изменилось
+        if self.mode_combobox.get() != mode_name:
+            self.mode_combobox.set(mode_name)
+            self.log_message(f"Combobox обновлен на: {mode_name}")
+
+    def set_device_mode(self):
+        """Установка нового режима работы устройства"""
+        if not self.connected or not self.serial_port or not self.serial_port.is_open:
+            messagebox.showerror("Ошибка", "Нет подключения к устройству")
+            return
+            
+        selected_mode_name = self.mode_combobox.get()
+        mode_value = None
+        
+        for value, name in self.device_modes.items():
+            if name == selected_mode_name:
+                mode_value = value
+                break
+                
+        if mode_value is None:
+            messagebox.showerror("Ошибка", "Неверный режим")
+            return
+            
+        # Формируем команду SET_MODE
+        request = bytes([
+            0x41, 0x41,
+            0x04,
+            0x64, 0x00,
+            (mode_value & 0xFF),
+            ((mode_value >> 8) & 0xFF)
+        ])
+        
+        if self.send_request_with_delay(request):
+            self.log_message(f"Отправлен запрос смены режима на: {selected_mode_name} (код: {mode_value})")
+            self.log_message(f"Команда: {request.hex(' ')}")
+            
+            # Временно обновляем combobox (ожидая подтверждения от устройства)
+            self.mode_combobox.set(selected_mode_name)
+            
+            # Останавливаем текущий опрос
+            self.polling_active = False
+            
+            # Сбрасываем данные
+            self.sensor_data = {}
+            self.sensors_count = 0
+            self.current_sensor_index = 0
+            
+            # Удаляем старые вкладки датчиков
+            for tab in self.notebook.tabs()[1:]:
+                self.notebook.forget(tab)
+            
+            # Через небольшую задержку запрашиваем новую конфигурацию
+            self.root.after(1000, self.request_initial_config)
+
+    def request_initial_config(self):
+        """Запрос начальной конфигурации после смены режима"""
+        self.log_message("Запрос конфигурации после смены режима...")
+        self.request_device_mode()
+        self.request_sensor_count()
+
+    def request_device_mode(self):
+        """Запрос текущего режима работы устройства"""
+        if not self.connected or not self.serial_port or not self.serial_port.is_open:
+            return
+            
+        request = bytes([
+            0x41, 0x41,
+            0x02,
+            0x04, 0x00
+        ])
+        
+        if self.send_request_with_delay(request):
+            self.log_message("Запрос текущего режима устройства")
+
+    def get_device_mode(self):
+        """Запрос текущего режима работы устройства (ручной)"""
+        self.request_device_mode()
+
     def check_alive_status(self):
-        """Check if device is still alive (responding)"""
         if self.connected and self.serial_port and self.serial_port.is_open:
-            current_time = time.time() * 1000  # Convert to milliseconds
+            current_time = time.time() * 1000
             time_diff = current_time - self.last_alive_time
             
             if time_diff > self.alive_timeout:
-                # Device is not responding
                 self.alive_status.config(text="[ALIVE: NO RESPONSE]", fg="red")
                 self.log_message("Ошибка: Устройство не отвечает (Alive timeout)")
-                self.reset_sensor_values()  # Сбрасываем значения датчиков
+                self.reset_sensor_values()
             else:
-                # Device is responding
                 self.alive_status.config(text="[ALIVE: OK]", fg="green")
         
         self.root.after(self.alive_check_interval, self.check_alive_status)
 
     def reset_sensor_values(self):
-        """Reset all sensor values to default/undefined state"""
         for sensor_index in self.sensor_widgets:
             widgets = self.sensor_widgets[sensor_index]
-            
-            # Обновляем все виджеты на вкладках датчиков
             widgets['type'].config(text="---")
             widgets['location'].config(text="---")
             widgets['value'].config(text="---")
@@ -137,7 +241,6 @@ class SensorApp:
             widgets['fault_detection'].config(text="---", fg="black")
             widgets['fault_level'].config(text="---")
         
-        # Также очищаем данные в памяти
         self.sensor_data = {}
         self.log_message("Значения датчиков сброшены из-за потери связи")
 
@@ -171,7 +274,6 @@ class SensorApp:
             self.status_label.config(text="Статус: COM-порты не найдены")
     
     def connect_to_port(self):
-        # Добавляем небольшую задержку перед повторным подключением
         time.sleep(0.5)
         
         port_name = self.port_combobox.get()
@@ -186,27 +288,26 @@ class SensorApp:
                 pass
                 
         try:
-            # Создаем новый экземпляр Serial вместо повторного использования старого
             self.serial_port = serial.Serial(port_name, baudrate=9600, timeout=1)
             self.connected = True
-            self.running = True  # Убедимся, что флаг running установлен
-            self.last_alive_time = time.time() * 1000  # Initialize alive timer
+            self.running = True
+            self.last_alive_time = time.time() * 1000
             self.status_label.config(text=f"Статус: Подключено к {port_name}")
             self.alive_status.config(text="[ALIVE: ---]", fg="gray")
             self.log_message(f"Успешное подключение к {port_name}")
             
-            # Update UI
             self.connect_btn.config(state=tk.DISABLED)
             self.disconnect_btn.config(state=tk.NORMAL)
+            self.set_mode_btn.config(state=tk.NORMAL)
+            self.get_mode_btn.config(state=tk.NORMAL)
             self.port_combobox.config(state='disabled')
             
-            # Перезапускаем поток чтения, если он завершился
             if not self.read_thread.is_alive():
                 self.read_thread = Thread(target=self.read_serial_data, daemon=True)
                 self.read_thread.start()
             
-            # Start communication
-            self.request_sensor_count()
+            # Запрашиваем начальную конфигурацию
+            self.request_initial_config()
             
         except Exception as e:
             self.status_label.config(text="Статус: Ошибка подключения")
@@ -214,19 +315,14 @@ class SensorApp:
             messagebox.showerror("Ошибка", f"Не удалось подключиться к {port_name}:\n{str(e)}")
 
     def disconnect_port(self):
-        """Close serial port and stop polling"""
         self.polling_active = False
         self.connected = False
-        
-        # Останавливаем поток чтения
         self.running = False
         
-        # Даем время потоку завершиться
         time.sleep(0.1)
         
         try:
             if self.serial_port and hasattr(self.serial_port, 'is_open'):
-                # Очищаем буферы перед закрытием
                 self.serial_port.reset_input_buffer()
                 self.serial_port.reset_output_buffer()
                 self.serial_port.close()
@@ -234,29 +330,30 @@ class SensorApp:
         except Exception as e:
             self.log_message(f"Ошибка при закрытии порта: {str(e)}")
         
-        # Обновляем интерфейс
         self.status_label.config(text="Статус: Не подключено")
         self.alive_status.config(text="[ALIVE: ---]", fg="gray")
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
+        self.set_mode_btn.config(state=tk.DISABLED)
+        self.get_mode_btn.config(state=tk.DISABLED)
         self.port_combobox.config(state='readonly')
+        self.mode_status_label.config(text="Текущий: ---", fg="blue")
+        
+        # Сбрасываем combobox к значению по умолчанию
+        self.mode_combobox.set("NORMAL_0")
 
-        # Очищаем данные
         self.sensor_data = {}
         self.sensors_count = 0
         self.current_sensor_index = 0
         
-        # Удаляем вкладки датчиков
         for tab in self.notebook.tabs()[1:]:
             self.notebook.forget(tab)
 
     def log_message(self, message):
         self.system_text.config(state=tk.NORMAL)
         
-        # Проверяем, не превышен ли лимит строк
         line_count = int(self.system_text.index('end-1c').split('.')[0])
         if line_count >= self.max_log_lines:
-            # Удаляем старые 10% сообщений
             delete_lines = min(self.log_buffer_size, line_count)
             self.system_text.delete(1.0, f"{delete_lines}.0")
             self.system_text.insert(tk.END, f"... удалено {delete_lines} старых строк ...\n")
@@ -277,19 +374,16 @@ class SensorApp:
         return True
     
     def request_sensor_count(self):
-        # New protocol format: 0x41 0x41 <len> <cmd_lsb> <cmd_msb> <params...>
-        request = bytes([0x41, 0x41, 0x02, 0x02, 0x00])  # GET_SENSORS_COUNT = 0x0002
+        request = bytes([0x41, 0x41, 0x02, 0x02, 0x00])
         if self.send_request_with_delay(request):
-            self.log_message("Отправлен запрос количества датчиков: 41 41 02 02 00")
+            self.log_message("Отправлен запрос количества датчиков")
     
     def request_sensor_data(self, sensor_index):
-        # New protocol format: 0x41 0x41 <len> <cmd_lsb> <cmd_msb> <params...>
-        # GET_SENSOR_DATA = 0x0003, параметр - индекс датчика (2 байта)
         request = bytes([
-            0x41, 0x41,  # Header
-            0x04,         # Length (cmd + param)
-            0x03, 0x00,   # GET_SENSOR_DATA (0x0003)
-            (sensor_index & 0xFF), ((sensor_index >> 8) & 0xFF)  # Sensor index (2 bytes)
+            0x41, 0x41,
+            0x04,
+            0x03, 0x00,
+            (sensor_index & 0xFF), ((sensor_index >> 8) & 0xFF)
         ])
         if self.send_request_with_delay(request):
             self.log_message(f"Запрос данных датчика {sensor_index} отправлен")
@@ -297,23 +391,21 @@ class SensorApp:
     def read_serial_data(self):
         while self.running:
             try:
-                # Проверяем, что порт существует и открыт
                 if not self.serial_port or not hasattr(self.serial_port, 'is_open') or not self.serial_port.is_open:
                     time.sleep(1)
                     continue
                     
                 try:
-                    # Безопасная проверка наличия данных
                     if self.serial_port.in_waiting > 0:
                         data = self.serial_port.read(self.serial_port.in_waiting)
                         self.process_received_data(data)
                 except (serial.SerialException, OSError) as e:
-                    if self.running:  # Логируем только если не было запроса на закрытие
+                    if self.running:
                         self.log_message(f"Ошибка чтения порта: {str(e)}")
                     time.sleep(1)
                     
             except Exception as e:
-                if self.running:  # Логируем только если не было запроса на закрытие
+                if self.running:
                     self.log_message(f"Ошибка в потоке чтения: {str(e)}")
                 time.sleep(1)
                 
@@ -323,7 +415,7 @@ class SensorApp:
         self.log_message(f"Получены данные: {data.hex(' ')}")
         
         pos = 0
-        while pos <= len(data) - 4:  # Минимум 4 байта (заголовок + длина)
+        while pos <= len(data) - 4:
             if data[pos] == 0x41 and data[pos+1] == 0x41:
                 payload_len = data[pos+2]
                 message_end = pos + 3 + payload_len
@@ -346,7 +438,6 @@ class SensorApp:
                 # Обработка данных датчика (0x0003)
                 if cmd_code == 0x0003 and payload_len >= 13:
                     try:
-                        # Проверяем, что в сообщении достаточно данных (3 заголовок + 13 payload)
                         if len(data) >= pos + 16:
                             sensor_index = data[pos+5] | (data[pos+6] << 8)
                             sensor_type = data[pos+7]
@@ -397,48 +488,76 @@ class SensorApp:
                     pos = message_end
                     continue
                     
+                # Обработка ответа на SET_MODE (0x0064)
+                if cmd_code == 0x0064 and payload_len >= 2:
+                    mode_value = data[pos+5] | (data[pos+6] << 8)
+                    mode_name = self.device_modes.get(mode_value, f"UNKNOWN ({mode_value})")
+                    
+                    self.current_mode = mode_value
+                    self.mode_status_label.config(text=f"Текущий: {mode_name}", fg="green")
+                    self.update_mode_combobox(mode_value)  # Обновляем combobox
+                    self.log_message(f"Успешно установлен режим: {mode_name}")
+                    
+                    # Автоматически запрашиваем новую конфигурацию
+                    self.root.after(500, self.request_initial_config)
+                    pos = message_end
+                    continue
+                    
+                # Обработка ответа на GET_MODE (0x0004)
+                if cmd_code == 0x0004 and payload_len >= 2:
+                    mode_value = data[pos+5] | (data[pos+6] << 8)
+                    mode_name = self.device_modes.get(mode_value, f"UNKNOWN ({mode_value})")
+                    
+                    self.current_mode = mode_value
+                    self.mode_status_label.config(text=f"Текущий: {mode_name}", fg="blue")
+                    self.update_mode_combobox(mode_value)  # Обновляем combobox
+                    self.log_message(f"Получен текущий режим: {mode_name}")
+                    pos = message_end
+                    continue
+                    
+                # Обработка NACK ответа (0x0000)
+                if cmd_code == 0x0000 and payload_len >= 2:
+                    nack_code = data[pos+5] | (data[pos+6] << 8)
+                    nack_messages = {
+                        1: "Неверная команда",
+                        2: "Устройство занято", 
+                        3: "Неверный параметр"
+                    }
+                    error_msg = nack_messages.get(nack_code, f"Неизвестная ошибка (код: {nack_code})")
+                    self.log_message(f"Ошибка от устройства: {error_msg}")
+                    messagebox.showerror("Ошибка устройства", error_msg)
+                    pos = message_end
+                    continue
+                    
             pos += 1
 
     def initialize_sensor_system(self):
-        """Initialize sensor tabs and start polling"""
-        # Create tabs for each sensor
         self.create_sensor_tabs()
-        
-        # Start polling cycle
         self.polling_active = True
         self.poll_next_sensor()
 
     def poll_next_sensor(self):
-        """Poll next sensor in sequence"""
         if not self.polling_active or not self.connected or not self.serial_port.is_open:
             return
             
         if self.sensors_count > 0:
             self.request_sensor_data(self.current_sensor_index)
-            
-            # Move to next sensor (circular)
             self.current_sensor_index = (self.current_sensor_index + 1) % self.sensors_count
-            
-            # Schedule next poll
             self.root.after(self.polling_interval, self.poll_next_sensor)
 
     def create_sensor_tabs(self):
-        """Create tabs for each sensor"""
         if not hasattr(self, 'notebook'):
             return
             
-        # Remove old tabs
         for tab in self.notebook.tabs()[1:]:
             self.notebook.forget(tab)
         
         self.sensor_widgets = {}
         
-        # Create tabs for each sensor
         for i in range(self.sensors_count):
             tab = ttk.Frame(self.notebook)
             self.notebook.add(tab, text=f"Датчик {i}")
             
-            # Header
             ttk.Label(tab, text=f"Данные датчика {i}", 
                     font=('Arial', 12, 'bold')).pack(pady=5)
             
@@ -522,7 +641,6 @@ class SensorApp:
             unit = self.get_sensor_units(sensor_type)
             processed_value = self.calculate_processed_value(data)
             
-            # Обработка fault_level
             if data['fault_level'] == 0xFFFF:
                 fault_level_text = "---"
             else:
@@ -549,16 +667,7 @@ class SensorApp:
             )
             widgets['fault_level'].config(text=fault_level_text)
     
-    def update_data(self):
-        if hasattr(self, 'sensor_widgets'):
-            for sensor_index in self.sensor_widgets:
-                if sensor_index in self.sensor_data:
-                    self.update_sensor_display(sensor_index)
-        
-        self.root.after(500, self.update_data)
-    
     def on_closing(self):
-        """Cleanup on window close"""
         self.polling_active = False
         self.running = False
         if self.serial_port and self.serial_port.is_open:
