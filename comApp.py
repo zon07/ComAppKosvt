@@ -38,13 +38,17 @@ class SensorApp:
         
         # Режимы работы устройства
         self.device_modes = {
-            0: "NORMAL_0",
-            1: "NORMAL_1", 
-            2: "CALIBRATION",
-            3: "SAFE",
-            4: "FACTORY_TEST"
+            0: "UNDEF",
+            1: "NORMAL_0", 
+            2: "NORMAL_1",
+            3: "FACTORY_TEST"
         }
         self.current_mode = 0
+        
+        # Переменные для синхронизации смены режима
+        self.mode_verification_count = 0
+        self.expected_mode = None
+        self.expected_mode_name = None
         
         self.create_widgets()
         self.update_ports_list()
@@ -136,6 +140,11 @@ class SensorApp:
         """Обновление combobox в соответствии с текущим режимом устройства"""
         mode_name = self.device_modes.get(mode_value, "UNKNOWN")
         
+        # Защита от установки несуществующего режима
+        if mode_name == "UNKNOWN":
+            self.log_message(f"⚠️ Получен неизвестный режим: {mode_value}")
+            return
+            
         # Обновляем combobox только если значение изменилось
         if self.mode_combobox.get() != mode_name:
             self.mode_combobox.set(mode_name)
@@ -159,6 +168,11 @@ class SensorApp:
             messagebox.showerror("Ошибка", "Неверный режим")
             return
             
+        # Дополнительная проверка - не пытаемся установить тот же режим
+        if mode_value == self.current_mode:
+            self.log_message(f"ℹ️ Устройство уже находится в режиме {selected_mode_name}")
+            return
+            
         # Формируем команду SET_MODE
         request = bytes([
             0x41, 0x41,
@@ -169,32 +183,117 @@ class SensorApp:
         ])
         
         if self.send_request_with_delay(request):
-            self.log_message(f"Отправлен запрос смены режима на: {selected_mode_name} (код: {mode_value})")
-            self.log_message(f"Команда: {request.hex(' ')}")
+            self.log_message(f"🔄 Отправлен запрос смены режима на: {selected_mode_name} (код: {mode_value})")
             
-            # Временно обновляем combobox (ожидая подтверждения от устройства)
-            self.mode_combobox.set(selected_mode_name)
+            # НЕ сбрасываем данные и НЕ останавливаем опрос здесь!
+            # Ждем подтверждения от устройства
             
-            # Останавливаем текущий опрос
-            self.polling_active = False
-            
-            # Сбрасываем данные
-            self.sensor_data = {}
-            self.sensors_count = 0
-            self.current_sensor_index = 0
-            
-            # Удаляем старые вкладки датчиков
-            for tab in self.notebook.tabs()[1:]:
-                self.notebook.forget(tab)
-            
-            # Через небольшую задержку запрашиваем новую конфигурацию
-            self.root.after(1000, self.request_initial_config)
+            # Запускаем синхронную проверку смены режима
+            self.start_mode_verification(mode_value, selected_mode_name)
 
-    def request_initial_config(self):
-        """Запрос начальной конфигурации после смены режима"""
-        self.log_message("Запрос конфигурации после смены режима...")
+    def start_mode_verification(self, expected_mode, mode_name):
+        """Запуск цикла проверки смены режима"""
+        self.mode_verification_count = 0
+        self.expected_mode = expected_mode
+        self.expected_mode_name = mode_name
+        self.log_message(f"🔍 Начало проверки смены режима на: {mode_name}")
+        
+        # Останавливаем опрос только при начале проверки (не при отправке запроса)
+        #self.polling_active = False
+        
+        # Сбрасываем флаг получения NACK
+        self.received_nack = False
+        
+        self.verify_mode_change()
+
+    def verify_mode_change(self):
+        """Проверка текущего режима устройства"""
+        if self.mode_verification_count >= 15 or self.received_nack:
+            if self.received_nack:
+                self.log_message("❌ ОШИБКА: Устройство отвергло запрос смены режима")
+                # Восстанавливаем предыдущий режим в combobox
+                self.update_mode_combobox(self.current_mode)
+                self.mode_status_label.config(text=f"Текущий: {self.device_modes.get(self.current_mode, 'UNKNOWN')}", fg="red")
+                messagebox.showerror("Ошибка", "Устройство отвергло запрос смены режима\nВозможно выбран недопустимый режим")
+                
+                # НЕ нужно восстанавливать опрос - он никогда не останавливался!
+                # self.polling_active = True  # ← УБРАТЬ ЭТУ СТРОКУ!
+                # if self.sensors_count > 0:
+                #     self.poll_next_sensor()  # ← УБРАТЬ ЭТУ СТРОКУ!
+            else:
+                self.log_message("❌ ТАЙМАУТ: Режим не подтвержден после 15 попыток")
+                self.mode_status_label.config(text="Текущий: ---", fg="red")
+                
+                # Сбрасываем данные только при таймауте (режим неизвестен)
+                self.sensor_data = {}
+                self.sensors_count = 0
+                self.current_sensor_index = 0
+                
+                # Удаляем старые вкладки датчиков
+                for tab in self.notebook.tabs()[1:]:
+                    self.notebook.forget(tab)
+            return
+            
+        self.mode_verification_count += 1
+        self.log_message(f"🔄 Проверка режима [{self.mode_verification_count}/15]...")
+        
+        # Запрашиваем текущий режим
         self.request_device_mode()
+        
+        # Проверяем через 300мс
+        self.root.after(300, self.check_mode_confirmation)
+
+    def check_mode_confirmation(self):
+        """Проверка подтверждения смены режима"""
+        if self.received_nack:
+            return  # Прерываем если получили NACK
+            
+        if self.current_mode == self.expected_mode:
+            self.log_message(f"✅ Режим подтвержден: {self.expected_mode_name}")
+            self.mode_status_label.config(text=f"Текущий: {self.expected_mode_name}", fg="green")
+            
+            # ТОЛЬКО ПОСЛЕ ПОДТВЕРЖДЕНИЯ запрашиваем конфигурацию
+            self.root.after(500, self.request_new_configuration_after_mode_change)
+        else:
+            # Продолжаем проверку
+            self.verify_mode_change()
+
+    def request_new_configuration_after_mode_change(self):
+        """Запрос новой конфигурации ПОСЛЕ подтверждения смены режима"""
+        self.log_message("📋 Запрос новой конфигурации устройства...")
+        
+        # Сбрасываем данные только после подтверждения смены режима
+        self.sensor_data = {}
+        self.sensors_count = 0
+        self.current_sensor_index = 0
+        
+        # Удаляем старые вкладки датчиков
+        for tab in self.notebook.tabs()[1:]:
+            self.notebook.forget(tab)
+        
+        # 1. Сначала запрашиваем количество датчиков
         self.request_sensor_count()
+        
+        # 2. Через 500мс запрашиваем текущий режим для финального подтверждения
+        self.root.after(500, self.final_mode_verification)
+
+    def final_mode_verification(self):
+        """Финальная проверка режима и запуск опроса датчиков"""
+        self.request_device_mode()
+        
+        # Запускаем опрос датчиков через 1 секунду
+        self.root.after(1000, self.start_sensor_polling)
+
+    def start_sensor_polling(self):
+        """Запуск опроса датчиков после успешной смены режима"""
+        if self.sensors_count > 0:
+            self.log_message(f"🚀 Запуск опроса {self.sensors_count} датчиков")
+            self.polling_active = True
+            self.poll_next_sensor()
+        else:
+            self.log_message("⚠️ Количество датчиков = 0, опрос не запущен")
+            # Пытаемся повторно запросить количество датчиков
+            self.root.after(1000, self.request_sensor_count)
 
     def request_device_mode(self):
         """Запрос текущего режима работы устройства"""
@@ -208,7 +307,7 @@ class SensorApp:
         ])
         
         if self.send_request_with_delay(request):
-            self.log_message("Запрос текущего режима устройства")
+            self.log_message("📊 Запрос текущего режима устройства")
 
     def get_device_mode(self):
         """Запрос текущего режима работы устройства (ручной)"""
@@ -294,7 +393,7 @@ class SensorApp:
             self.last_alive_time = time.time() * 1000
             self.status_label.config(text=f"Статус: Подключено к {port_name}")
             self.alive_status.config(text="[ALIVE: ---]", fg="gray")
-            self.log_message(f"Успешное подключение к {port_name}")
+            self.log_message(f"✅ Успешное подключение к {port_name}")
             
             self.connect_btn.config(state=tk.DISABLED)
             self.disconnect_btn.config(state=tk.NORMAL)
@@ -311,7 +410,7 @@ class SensorApp:
             
         except Exception as e:
             self.status_label.config(text="Статус: Ошибка подключения")
-            self.log_message(f"Ошибка подключения к {port_name}: {str(e)}")
+            self.log_message(f"❌ Ошибка подключения к {port_name}: {str(e)}")
             messagebox.showerror("Ошибка", f"Не удалось подключиться к {port_name}:\n{str(e)}")
 
     def disconnect_port(self):
@@ -376,7 +475,7 @@ class SensorApp:
     def request_sensor_count(self):
         request = bytes([0x41, 0x41, 0x02, 0x02, 0x00])
         if self.send_request_with_delay(request):
-            self.log_message("Отправлен запрос количества датчиков")
+            self.log_message("📊 Запрос количества датчиков")
     
     def request_sensor_data(self, sensor_index):
         request = bytes([
@@ -386,7 +485,7 @@ class SensorApp:
             (sensor_index & 0xFF), ((sensor_index >> 8) & 0xFF)
         ])
         if self.send_request_with_delay(request):
-            self.log_message(f"Запрос данных датчика {sensor_index} отправлен")
+            self.log_message(f"📡 Запрос данных датчика {sensor_index} отправлен")
     
     def read_serial_data(self):
         while self.running:
@@ -412,7 +511,7 @@ class SensorApp:
             time.sleep(0.1)
     
     def process_received_data(self, data):
-        self.log_message(f"Получены данные: {data.hex(' ')}")
+        self.log_message(f"📨 Получены данные: {data.hex(' ')}")
         
         pos = 0
         while pos <= len(data) - 4:
@@ -421,7 +520,7 @@ class SensorApp:
                 message_end = pos + 3 + payload_len
                 
                 if message_end > len(data):
-                    self.log_message(f"Неполное сообщение, ожидается {payload_len} байт")
+                    self.log_message(f"⚠️ Неполное сообщение, ожидается {payload_len} байт")
                     break
                     
                 cmd_code = data[pos+3] | (data[pos+4] << 8)
@@ -430,7 +529,7 @@ class SensorApp:
                 # Обработка ответа с количеством датчиков (0x0002)
                 if cmd_code == 0x0002 and payload_len >= 1:
                     self.sensors_count = data[pos+5]
-                    self.log_message(f"Получено количество датчиков: {self.sensors_count}")
+                    self.log_message(f"📊 Получено количество датчиков: {self.sensors_count}")
                     self.initialize_sensor_system()
                     pos = message_end
                     continue
@@ -462,29 +561,29 @@ class SensorApp:
                             }
                             
                             self.log_message(
-                                f"Данные датчика {sensor_index}:\n"
-                                f"Тип: {self.get_sensor_type_name(sensor_type)}\n"
-                                f"Значение: {value}\n"
-                                f"Усиление: {gain}\n"
-                                f"Смещение: {offset}\n"
-                                f"Статус: {'VALID' if is_valid else 'INVALID'}\n"
-                                f"Расположение: {location}\n"
-                                f"Детекция ошибок: {'ON' if is_fault_detection else 'OFF'}\n"
-                                f"Уровень ошибки: {fault_level}"
+                                f"📡 Данные датчика {sensor_index}:\n"
+                                f"   Тип: {self.get_sensor_type_name(sensor_type)}\n"
+                                f"   Значение: {value}\n"
+                                f"   Усиление: {gain}\n"
+                                f"   Смещение: {offset}\n"
+                                f"   Статус: {'VALID' if is_valid else 'INVALID'}\n"
+                                f"   Расположение: {location}\n"
+                                f"   Детекция ошибок: {'ON' if is_fault_detection else 'OFF'}\n"
+                                f"   Уровень ошибки: {fault_level}"
                             )
                             
                             self.root.after(0, lambda idx=sensor_index: self.update_sensor_display(idx))
                         else:
-                            self.log_message("Ошибка: Недостаточно данных в сообщении датчика")
+                            self.log_message("❌ Ошибка: Недостаточно данных в сообщении датчика")
                     except IndexError as e:
-                        self.log_message(f"Ошибка обработки данных датчика: {str(e)}")
+                        self.log_message(f"❌ Ошибка обработки данных датчика: {str(e)}")
                     finally:
                         pos = message_end
                         continue
                         
                 # Обработка Alive-сообщения (0x0001)
                 if cmd_code == 0x0001:
-                    self.log_message("Получен Alive ответ от устройства")
+                    self.log_message("💓 Получен Alive ответ от устройства")
                     pos = message_end
                     continue
                     
@@ -495,11 +594,10 @@ class SensorApp:
                     
                     self.current_mode = mode_value
                     self.mode_status_label.config(text=f"Текущий: {mode_name}", fg="green")
-                    self.update_mode_combobox(mode_value)  # Обновляем combobox
-                    self.log_message(f"Успешно установлен режим: {mode_name}")
+                    self.update_mode_combobox(mode_value)
+                    self.log_message(f"✅ Подтверждение установки режима: {mode_name}")
                     
-                    # Автоматически запрашиваем новую конфигурацию
-                    self.root.after(500, self.request_initial_config)
+                    # НЕ запускаем автоматически конфигурацию - ждем проверки
                     pos = message_end
                     continue
                     
@@ -510,12 +608,20 @@ class SensorApp:
                     
                     self.current_mode = mode_value
                     self.mode_status_label.config(text=f"Текущий: {mode_name}", fg="blue")
-                    self.update_mode_combobox(mode_value)  # Обновляем combobox
-                    self.log_message(f"Получен текущий режим: {mode_name}")
+                    self.update_mode_combobox(mode_value)
+                    self.log_message(f"📊 Получен текущий режим: {mode_name}")
+                    
+                    # Логируем для отладки синхронизации
+                    if hasattr(self, 'expected_mode'):
+                        if mode_value == self.expected_mode:
+                            self.log_message("🎯 Режим совпадает с ожидаемым!")
+                        else:
+                            self.log_message(f"⚠️ Режим не совпадает: ожидали {self.expected_mode}, получили {mode_value}")
+                    
                     pos = message_end
                     continue
                     
-                # Обработка NACK ответа (0x0000)
+                # Обработка NACK ответа (0x0000) - ОБНОВЛЕННАЯ ЛОГИКА
                 if cmd_code == 0x0000 and payload_len >= 2:
                     nack_code = data[pos+5] | (data[pos+6] << 8)
                     nack_messages = {
@@ -524,8 +630,17 @@ class SensorApp:
                         3: "Неверный параметр"
                     }
                     error_msg = nack_messages.get(nack_code, f"Неизвестная ошибка (код: {nack_code})")
-                    self.log_message(f"Ошибка от устройства: {error_msg}")
-                    messagebox.showerror("Ошибка устройства", error_msg)
+                    self.log_message(f"❌ Ошибка от устройства: {error_msg}")
+                    
+                    # ОСОБАЯ ОБРАБОТКА ДЛЯ SET_MODE
+                    if hasattr(self, 'expected_mode') and self.expected_mode is not None:
+                        self.log_message("❌ Смена режима отклонена устройством!")
+                        self.received_nack = True  # Устанавливаем флаг получения NACK
+                        # НЕ показываем messagebox здесь - он покажется в verify_mode_change
+                    else:
+                        # Для других команд показываем сообщение сразу
+                        messagebox.showerror("Ошибка устройства", error_msg)
+                    
                     pos = message_end
                     continue
                     
@@ -666,6 +781,12 @@ class SensorApp:
                 fg="green" if data['is_fault_detection'] else "red"
             )
             widgets['fault_level'].config(text=fault_level_text)
+    
+    def request_initial_config(self):
+        """Запрос начальной конфигурации при подключении"""
+        self.log_message("📋 Запрос начальной конфигурации устройства...")
+        self.request_device_mode()
+        self.root.after(500, self.request_sensor_count)
     
     def on_closing(self):
         self.polling_active = False
