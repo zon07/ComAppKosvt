@@ -36,6 +36,9 @@ class SensorApp:
         self.max_log_lines = 1000
         self.log_buffer_size = 100
         
+        # RTS control
+        self.rts_state = False
+        
         # Режимы работы устройства
         self.device_modes = {
             0: "UNDEF",
@@ -107,6 +110,19 @@ class SensorApp:
         self.mode_status_label = tk.Label(mode_frame, text="Текущий: ---", fg="blue")
         self.mode_status_label.pack(side=tk.LEFT, padx=10)
         
+        # RTS control frame
+        rts_frame = tk.Frame(control_frame)
+        rts_frame.pack(fill=tk.X, pady=2)
+        
+        tk.Label(rts_frame, text="RTS пин:").pack(side=tk.LEFT)
+        
+        self.rts_btn = tk.Button(rts_frame, text="RTS: ВЫКЛ", 
+                               command=self.toggle_rts, 
+                               state=tk.DISABLED,
+                               bg="light gray",
+                               width=10)
+        self.rts_btn.pack(side=tk.LEFT, padx=5)
+        
         # Status label
         status_frame = tk.Frame(control_frame)
         status_frame.pack(fill=tk.X, pady=2)
@@ -135,6 +151,60 @@ class SensorApp:
         self.context_menu.add_command(label="Копировать", command=self.copy_from_log)
         self.context_menu.add_command(label="Очистить лог", command=self.clear_log)
         self.system_text.bind("<Button-3>", self.show_context_menu)
+
+    def toggle_rts(self):
+        """Переключение состояния RTS пина (INVERTED: HIGH = устройство OFF, LOW = устройство ON)"""
+        if not self.connected or not self.serial_port or not self.serial_port.is_open:
+            messagebox.showerror("Ошибка", "Нет подключения к устройству")
+            return
+            
+        try:
+            # Переключаем состояние (инвертированная логика)
+            self.rts_state = not self.rts_state
+            self.serial_port.rts = self.rts_state
+            
+            # Даем время на установку состояния
+            time.sleep(0.05)
+            
+            # Читаем ФАКТИЧЕСКОЕ состояние пина
+            actual_rts_state = self.serial_port.rts
+            
+            # Обновляем внутреннее состояние по фактическому состоянию
+            self.rts_state = actual_rts_state
+            
+            # ИНВЕРТИРОВАННАЯ логика: HIGH = устройство OFF, LOW = устройство ON
+            if actual_rts_state:  # HIGH
+                self.rts_btn.config(text="RTS: OFF", bg="light gray")
+                self.log_message("🔴 Устройство ВЫКЛЮЧЕНО (RTS=HIGH)")
+            else:  # LOW
+                self.rts_btn.config(text="RTS: ON", bg="light green")
+                self.log_message("✅ Устройство ВКЛЮЧЕНО (RTS=LOW)")
+                
+            # Логируем для отладки
+            self.log_message(f"🔍 Состояние RTS пина: {actual_rts_state} (HIGH=OFF, LOW=ON)")
+                    
+        except Exception as e:
+            self.log_message(f"❌ Ошибка управления RTS: {str(e)}")
+            messagebox.showerror("Ошибка", f"Не удалось установить RTS: {str(e)}")
+
+    def update_rts_button_state(self):
+        """Обновление состояния кнопки RTS на основе фактического состояния пина (инвертированная логика)"""
+        if not self.connected or not self.serial_port or not self.serial_port.is_open:
+            return
+            
+        try:
+            # Читаем текущее состояние RTS
+            actual_rts_state = self.serial_port.rts
+            self.rts_state = actual_rts_state
+            
+            # ИНВЕРТИРОВАННАЯ логика: HIGH = устройство OFF, LOW = устройство ON
+            if actual_rts_state:
+                self.rts_btn.config(text="RTS: OFF", bg="light gray")
+            else:
+                self.rts_btn.config(text="RTS: ON", bg="light green")
+                
+        except Exception as e:
+            self.log_message(f"⚠️ Не удалось прочитать состояние RTS: {str(e)}")
 
     def update_mode_combobox(self, mode_value):
         """Обновление combobox в соответствии с текущим режимом устройства"""
@@ -387,18 +457,56 @@ class SensorApp:
                 pass
                 
         try:
-            self.serial_port = serial.Serial(port_name, baudrate=9600, timeout=1)
+            # Открываем порт с явным отключением аппаратного управления потоком
+            self.serial_port = serial.Serial(
+                port=port_name,
+                baudrate=9600,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=1,
+                xonxoff=False,    # Отключаем программное управление потоком
+                rtscts=False,     # ОЧЕНЬ ВАЖНО: отключаем аппаратное управление RTS/CTS
+                dsrdtr=False,     # Отключаем аппаратное управление DTR/DSR
+                write_timeout=None
+            )
+            
+            # Принудительно устанавливаем начальное состояние RTS
+            self.serial_port.rts = False
+            time.sleep(0.1)  # Даем время на установку состояния
+            
+            # Читаем ФАКТИЧЕСКОЕ состояние после инициализации
+            actual_rts_state = self.serial_port.rts
+            self.rts_state = actual_rts_state
+            
             self.connected = True
             self.running = True
             self.last_alive_time = time.time() * 1000
             self.status_label.config(text=f"Статус: Подключено к {port_name}")
             self.alive_status.config(text="[ALIVE: ---]", fg="gray")
             self.log_message(f"✅ Успешное подключение к {port_name}")
+            self.log_message("🔧 Порт сконфигурирован с RTSCTS=False для ручного управления RTS")
+            
+            # Обновляем кнопку по фактическому состоянию (инвертированная логика)
+            if actual_rts_state:
+                self.rts_btn.config(text="RTS: OFF", bg="light gray")
+                self.log_message("🔍 Начальное состояние: Устройство ВЫКЛЮЧЕНО (RTS=HIGH)")
+            else:
+                self.rts_btn.config(text="RTS: ON", bg="light green")
+                self.log_message("🔍 Начальное состояние: Устройство ВКЛЮЧЕНО (RTS=LOW)")
+            
+            # Проверяем состояние CTS для отладки
+            try:
+                current_cts = self.serial_port.cts
+                self.log_message(f"🔍 Состояние CTS: {current_cts}")
+            except:
+                pass
             
             self.connect_btn.config(state=tk.DISABLED)
             self.disconnect_btn.config(state=tk.NORMAL)
             self.set_mode_btn.config(state=tk.NORMAL)
             self.get_mode_btn.config(state=tk.NORMAL)
+            self.rts_btn.config(state=tk.NORMAL)
             self.port_combobox.config(state='disabled')
             
             if not self.read_thread.is_alive():
@@ -418,6 +526,16 @@ class SensorApp:
         self.connected = False
         self.running = False
         
+        # Сбрасываем RTS при отключении
+        if self.serial_port and hasattr(self.serial_port, 'is_open'):
+            try:
+                self.serial_port.rts = False
+                # Читаем конечное состояние для логирования
+                final_state = self.serial_port.rts
+                self.log_message(f"🔍 Конечное состояние RTS при отключении: {final_state}")
+            except:
+                pass
+        
         time.sleep(0.1)
         
         try:
@@ -435,6 +553,7 @@ class SensorApp:
         self.disconnect_btn.config(state=tk.DISABLED)
         self.set_mode_btn.config(state=tk.DISABLED)
         self.get_mode_btn.config(state=tk.DISABLED)
+        self.rts_btn.config(state=tk.DISABLED, text="RTS: OFF", bg="light gray")  # Всегда OFF при отключении
         self.port_combobox.config(state='readonly')
         self.mode_status_label.config(text="Текущий: ---", fg="blue")
         
@@ -467,7 +586,7 @@ class SensorApp:
             
         for byte in request:
             self.serial_port.write(bytes([byte]))
-            time.sleep(0.005)
+            time.sleep(0.003)
             
         self.serial_port.flush()
         return True
@@ -792,7 +911,11 @@ class SensorApp:
         self.polling_active = False
         self.running = False
         if self.serial_port and self.serial_port.is_open:
-            self.serial_port.close()
+            try:
+                self.serial_port.rts = False  # Сбрасываем RTS при закрытии
+                self.serial_port.close()
+            except:
+                pass
         self.root.destroy()
 
 if __name__ == "__main__":
