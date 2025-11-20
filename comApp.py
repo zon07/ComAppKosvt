@@ -586,7 +586,7 @@ class SensorApp:
             
         for byte in request:
             self.serial_port.write(bytes([byte]))
-            time.sleep(0.003)
+            #time.sleep(0.003)
             
         self.serial_port.flush()
         return True
