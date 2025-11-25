@@ -29,7 +29,7 @@ class SimpleUARTApp:
             "UART_CMD_GET_VERSION": 0x0002,             # Запрос версии ПО FLASH
             "UART_CMD_GET_SENSOR_COUNT": 0x0003,        # Запрос количества датчиков
             "UART_CMD_GET_SENSORS_INFO": 0x1000,        # Запрос информацию о всех датчиков
-            "UART_CMD_GET_SENSOR_VALUE_BASE": 0x2000,   # Базовый адрес команд Датчик 0
+            "UART_CMD_GET_SENSOR_VALUE_0": 0x2000,      # Базовый адрес команд Датчик 0
             "UART_CMD_GET_SENSOR_VALUE_1": 0x2001,      # Датчик 1
             "UART_CMD_GET_SENSOR_VALUE_2": 0x2002,      # Датчик 2
             "UART_CMD_GET_SENSOR_VALUE_3": 0x2003,      # Датчик 3
@@ -39,7 +39,11 @@ class SimpleUARTApp:
             "UART_CMD_GET_SERIAL": 0xF500,              # Запрос серийного номера
 
             # --- Команды записи (SET) ---
-            "UART_CMD_SET_FAULT_VALUE": 0x5000,         # Базовый адрес установки аварийного уровня
+            "UART_CMD_SET_FAULT_VALUE_0": 0x5000,         # Установки аварийного уровня Датчик 0
+            "UART_CMD_SET_FAULT_VALUE_1": 0x5001,         # Установки аварийного уровня Датчик 1
+            "UART_CMD_SET_FAULT_VALUE_2": 0x5002,         # Установки аварийного уровня Датчик 2
+            "UART_CMD_SET_FAULT_VALUE_3": 0x5003,         # Установки аварийного уровня Датчик 3
+            "UART_CMD_SET_FAULT_VALUE_4": 0x5004,         # Установки аварийного уровня Датчик 4                                    
             "UART_CMD_SET_SERIAL": 0xF505,              # Записать серийный номер
 
             # --- Старые команды (сохранены для обратной совместимости) ---
@@ -51,6 +55,16 @@ class SimpleUARTApp:
 
             # --- Максимальное значение ---
             "UART_CMD_MAX": 0xFFFF                      # Максимальное значение команды
+        }
+
+        # NACK codes from uart_protocol.h
+        self.UART_NACK_CODES = {
+            0: "UART_NACK_CODE_UNDEF - Неопределенная ошибка",
+            1: "UART_NACK_CODE_WRONG_CMD - Неверная команда",
+            2: "UART_NACK_CODE_BUSY - Устройство занято",
+            3: "UART_NACK_CODE_INVALID_PARAM - Неверный параметр",
+            4: "UART_NACK_CODE_INTERNAL_ERROR - Внутренняя ошибка",
+            0xFFFF: "UART_NACK_CODE_MAX - Максимальное значение кода NACK"
         }
 
         self.command_descriptions = {
@@ -69,7 +83,11 @@ class SimpleUARTApp:
             "UART_CMD_GET_SERIAL": "Запрос серийного номера",
 
             # --- Команды записи (SET) ---
-            "UART_CMD_SET_FAULT_VALUE": "Базовый адрес установки аварийного уровня",
+            "UART_CMD_SET_FAULT_VALUE_0": "Установки аварийного уровня Датчик 0",
+            "UART_CMD_SET_FAULT_VALUE_1": "Установки аварийного уровня Датчик 1",
+            "UART_CMD_SET_FAULT_VALUE_2": "Установки аварийного уровня Датчик 2",
+            "UART_CMD_SET_FAULT_VALUE_3": "Установки аварийного уровня Датчик 3",
+            "UART_CMD_SET_FAULT_VALUE_4": "Установки аварийного уровня Датчик 4", 
             "UART_CMD_SET_SERIAL": "Записать серийный номер",
 
             # --- Старые команды (сохранены для обратной совместимости) ---
@@ -294,6 +312,11 @@ class SimpleUARTApp:
                                        foreground="blue", wraplength=600)
         self.cmd_desc_label.grid(row=1, column=0, columnspan=5, sticky=tk.W, padx=5, pady=2)
         
+        # Parameter help
+        param_help_label = ttk.Label(cmd_frame, text="Формат: hex байты через пробел (33 55 77 или 0x33 0x55 0x77)", 
+                                   foreground="gray", font=("Arial", 8))
+        param_help_label.grid(row=2, column=2, columnspan=3, sticky=tk.W, padx=5, pady=0)
+        
         # Log frame
         log_frame = ttk.LabelFrame(main_frame, text="Лог коммуникации", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -424,20 +447,26 @@ class SimpleUARTApp:
         # Add parameter if needed
         if parameter is not None and parameter != "":
             try:
-                # Try to parse as hex or decimal
-                if isinstance(parameter, str) and parameter.startswith("0x"):
-                    param_value = int(parameter, 16)
-                else:
-                    param_value = int(parameter)
+                # Обработка последовательности hex-байтов
+                hex_bytes = parameter.strip().split()
+                param_bytes = bytearray()
                 
-                # Add parameter as big-endian (MSB first, LSB second)
-                payload.extend([
-                    (param_value >> 8) & 0xFF,    # MSB
-                    param_value & 0xFF            # LSB
-                ])
+                for hex_byte in hex_bytes:
+                    # Убираем префикс 0x если есть и преобразуем в число
+                    hex_byte_clean = hex_byte.lower().replace('0x', '')
+                    byte_value = int(hex_byte_clean, 16)
+                    
+                    # Проверяем что байт в диапазоне 0-255
+                    if byte_value < 0 or byte_value > 255:
+                        raise ValueError(f"Hex value out of range: {hex_byte}")
+                    
+                    param_bytes.append(byte_value)
+                
+                # Добавляем байты параметра к payload
+                payload.extend(param_bytes)
                 
             except ValueError as e:
-                raise ValueError(f"Invalid parameter: {parameter}") from e
+                raise ValueError(f"Invalid hex parameter: {parameter} - {str(e)}") from e
         
         return bytes(payload)
 
@@ -466,7 +495,9 @@ class SimpleUARTApp:
             self.log_message(f"   Длина пакета: {len(packet)} байт")
             self.log_message(f"   Команда: {command_name} (0x{self.UART_COMMANDS[command_name]:04X})")
             if parameter:
+                param_bytes = payload[2:]  # Байты после команды
                 self.log_message(f"   Параметр: {parameter}")
+                self.log_message(f"   Параметр (байты): {param_bytes.hex(' ').upper()}")
             self.log_message(f"   Payload: {payload.hex(' ').upper()}")
             self.log_message(f"   Полный пакет: {packet.hex(' ').upper()}")
             self.log_message(f"   CRC: 0x{packet[-1]:02X}")
@@ -568,6 +599,13 @@ class SimpleUARTApp:
         if len(payload) >= 2:
             # Big-endian command code (MSB first, LSB second)
             cmd_code = (payload[0] << 8) | payload[1]
+            
+            # Обработка NACK сообщений
+            if cmd_code == self.UART_COMMANDS["UART_CMD_NACK"]:
+                self.process_nack_message(payload)
+                return
+                
+            # Обработка Alive сообщений
             if cmd_code == self.UART_COMMANDS["UART_CMD_ALIVE"]:
                 # Не логируем Alive сообщения если включен фильтр
                 if not self.filter_alive_var.get():
@@ -595,6 +633,29 @@ class SimpleUARTApp:
             # Log parameters if present
             if len(payload) > 2:
                 self.log_message(f"   Параметры: {payload[2:].hex(' ').upper()}")
+        
+        self.log_message("")
+
+    def process_nack_message(self, payload):
+        """Обработка NACK сообщения с расшифровкой кода ошибки"""
+        self.log_message("❌ ПРИНЯТ NACK:")
+        self.log_message(f"   Длина payload: {len(payload)} байт")
+        self.log_message(f"   Payload: {payload.hex(' ').upper()}")
+        
+        # Parse NACK details
+        if len(payload) >= 4:
+            # Команда NACK уже известна (0xE000)
+            nack_code = (payload[2] << 8) | payload[3]  # Big-endian код ошибки
+            
+            # Расшифровка кода NACK
+            nack_description = self.UART_NACK_CODES.get(nack_code, f"Неизвестный код NACK: 0x{nack_code:04X}")
+            self.log_message(f"   Код ошибки: {nack_description}")
+            
+            # Дополнительные параметры если есть
+            if len(payload) > 4:
+                self.log_message(f"   Доп. параметры: {payload[4:].hex(' ').upper()}")
+        else:
+            self.log_message("   Некорректный формат NACK сообщения")
         
         self.log_message("")
 
