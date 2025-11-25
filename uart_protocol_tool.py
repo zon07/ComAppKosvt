@@ -655,6 +655,10 @@ class SimpleUARTApp:
                 dsrdtr=False
             )
             
+            # Принудительно устанавливаем начальное состояние RTS
+            self.serial_port.rts = False
+            time.sleep(0.1)  # Даем время на установку состояния
+                 
             # Тестируем соединение
             self.serial_port.reset_input_buffer()
             self.serial_port.reset_output_buffer()
