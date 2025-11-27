@@ -8,60 +8,78 @@ import time
 class SensorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("KOSTVT UART Monitor")
+        self.root.title("KOSTVT UART Monitor v2.0")
         
         # Фиксируем размер окна
-        self.root.geometry("700x500")
-        self.root.minsize(700, 500)
-        self.root.maxsize(700, 500)
+        self.root.geometry("800x600")
+        self.root.minsize(800, 600)
+        self.root.maxsize(800, 600)
         
         # Serial communication
         self.serial_port = None
         self.sensors_count = 0
         self.sensor_data = {}
         self.sensor_widgets = {}
+        self.sensor_info = {}  # Для хранения информации о датчиках
+        
+        # Protocol settings from uart_protocol_tool.py
+        self.HEADER_SEQUENCE = [0x1F, 0x8B, 0xE2, 0x74]
+        self.HEADER_LENGTH = len(self.HEADER_SEQUENCE)
+        self.MAX_PAYLOAD_SIZE = 64
+        
+        # UART commands from uart_protocol.h
+        self.UART_COMMANDS = {
+            "UART_CMD_GET_SENSOR_COUNT": 0x0003,
+            "UART_CMD_GET_SENSORS_INFO": 0x1000,
+            "UART_CMD_GET_SENSORS_VALUE": 0x3000,
+            "UART_CMD_GET_FAULTS_INFO": 0x4000,
+            "UART_CMD_SET_FAULT_VALUE": 0x5000,
+            "UART_CMD_NACK": 0xE000,
+            "UART_CMD_ALIVE": 0xE001,
+        }
+        
+        # Sensor types
+        self.sensor_types = {
+            0: "UNDEFINED",
+            1: "TEMPERATURE", 
+            2: "PRESSURE",
+            3: "HUMIDITY",
+            4: "DUST",
+            5: "COUNT"
+        }
+        
+        # Sensor locations
+        self.sensor_locations = {
+            0: "SENSOR_LOCATION_UNDEF",
+            1: "SENSOR_LOCATION_1",
+            2: "SENSOR_LOCATION_2", 
+            3: "SENSOR_LOCATION_3",
+            4: "SENSOR_LOCATION_4",
+            5: "SENSOR_LOCATION_5",
+            6: "SENSOR_LOCATION_6",
+            7: "SENSOR_LOCATION_7",
+            8: "SENSOR_LOCATION_COUNT"
+        }
         
         # Sensor polling
-        self.current_sensor_index = 0
-        self.polling_interval = 200
+        self.polling_interval = 500
         self.polling_active = False
         self.connected = False
         
         # Alive monitoring
         self.last_alive_time = 0
-        self.alive_timeout = 3000
+        self.alive_timeout = 5000
         self.alive_check_interval = 1000
+        
+        # Parser state
+        self.rx_buffer = bytearray()
+        self.parser_state = "WAIT_HEADER"
+        self.expected_length = 0
+        self.header_index = 0
         
         # Log buffer settings
         self.max_log_lines = 1000
         self.log_buffer_size = 100
-        
-        # RTS control
-        self.rts_state = False
-        
-        # Protocol constants
-        self.PROTOCOL_SYNC_BYTES = [0x41, 0x41]
-        self.MAX_PAYLOAD_SIZE = 64
-        
-        # Режимы работы устройства
-        self.device_modes = {
-            0: "UNDEF",
-            1: "NORMAL_0", 
-            2: "NORMAL_1",
-            3: "FACTORY_TEST"
-        }
-        self.current_mode = 0
-        
-        # Переменные для синхронизации
-        self.mode_verification_count = 0
-        self.expected_mode = None
-        self.expected_mode_name = None
-        self.received_nack = False
-        
-        # Буфер для приема данных
-        self.rx_buffer = bytearray()
-        self.parser_state = "WAIT_SYNC"
-        self.expected_length = 0
         
         self.create_widgets()
         self.update_ports_list()
@@ -85,101 +103,87 @@ class SensorApp:
         return crc
 
     def build_packet(self, payload):
-        """Построение пакета согласно uart_transport_parser.c"""
+        """Построение пакета с новым заголовком"""
         if len(payload) > self.MAX_PAYLOAD_SIZE:
-            raise ValueError(f"Payload too large")
+            raise ValueError(f"Payload too large: {len(payload)} bytes")
         
         packet = bytearray()
-        packet.extend([0x41, 0x41])  # 'A', 'A' - sync bytes
+        packet.extend(self.HEADER_SEQUENCE)  # Sync bytes
         packet.append(len(payload))  # Length
         
-        # Добавляем payload
+        # Add payload
         packet.extend(payload)
         
-        # CRC рассчитывается ТОЛЬКО по длине и payload (без sync байтов!)
+        # Calculate CRC (only length + payload, without header bytes)
         crc_data = bytearray()
         crc_data.append(len(payload))  # Length
         crc_data.extend(payload)       # Payload
         
         crc = self.crc8_calculate(crc_data)
-        packet.append(crc)  # Добавляем CRC
+        packet.append(crc)  # Add CRC
         
         return bytes(packet)
 
-    def verify_packet_crc(self, packet):
-        """Проверка CRC принятого пакета"""
-        if len(packet) < 4:
-            return False, "Packet too short for CRC check"
-        
-        # Берем все байты кроме последнего (CRC)
-        data_for_crc = packet[:-1]
-        received_crc = packet[-1]
-        
-        # Вычисляем CRC для принятых данных
-        calculated_crc = self.crc8_calculate(data_for_crc)
-        
-        if received_crc != calculated_crc:
-            return False, f"CRC mismatch: received 0x{received_crc:02X}, calculated 0x{calculated_crc:02X}"
-        
-        return True, "CRC OK"
-
     def parse_packet(self, packet_data):
-        """Разбор входящего пакета согласно uart_transport_parser.c"""
-        if len(packet_data) < 4:
+        """Разбор входящего пакета"""
+        min_packet_length = self.HEADER_LENGTH + 2  # header + length + crc
+        if len(packet_data) < min_packet_length:
             return None, "Packet too short"
         
-        # Проверка sync-байтов (должны быть 'A', 'A')
-        if packet_data[0] != 0x41 or packet_data[1] != 0x41:
-            return None, "Invalid sync bytes"
+        # Check header bytes
+        for i in range(self.HEADER_LENGTH):
+            if packet_data[i] != self.HEADER_SEQUENCE[i]:
+                return None, f"Invalid header byte at position {i}"
         
-        # Получаем длину payload
-        payload_length = packet_data[2]
+        # Get payload length
+        payload_length = packet_data[self.HEADER_LENGTH]
         
-        # Проверяем общую длину пакета
-        expected_packet_length = payload_length + 4  # sync(2) + len(1) + payload + crc(1)
+        # Check total packet length
+        expected_packet_length = self.HEADER_LENGTH + payload_length + 2
         if len(packet_data) != expected_packet_length:
             return None, f"Length mismatch"
         
-        # Проверяем CRC (только длина + payload)
+        # Verify CRC
         received_crc = packet_data[-1]
-        
-        # CRC рассчитывается только по длине и payload
         crc_data = bytearray()
-        crc_data.append(payload_length)  # Length
-        crc_data.extend(packet_data[3:3 + payload_length])  # Payload
+        crc_data.append(payload_length)  # Length byte
+        payload_start = self.HEADER_LENGTH + 1
+        crc_data.extend(packet_data[payload_start:payload_start + payload_length])
         
         calculated_crc = self.crc8_calculate(crc_data)
         
         if received_crc != calculated_crc:
             return None, f"CRC error"
         
-        # Извлекаем payload
-        payload = packet_data[3:3 + payload_length]
+        # Extract payload
+        payload = packet_data[payload_start:payload_start + payload_length]
         return payload, None
 
     def process_received_byte(self, byte):
-        """Обработка входящего байта (автомат состояний как в uart_transport_parser.c)"""
-        if self.parser_state == "WAIT_SYNC":
-            if byte == 0x41:  # 'A'
-                self.rx_buffer = bytearray([byte])
-                self.parser_state = "WAIT_SYNC2"
-            return None
-            
-        elif self.parser_state == "WAIT_SYNC2":
-            if byte == 0x41:  # 'A'
+        """Обработка входящего байта"""
+        if self.parser_state == "WAIT_HEADER":
+            if byte == self.HEADER_SEQUENCE[self.header_index]:
                 self.rx_buffer.append(byte)
-                self.parser_state = "WAIT_LENGTH"
+                self.header_index += 1
+                
+                if self.header_index >= self.HEADER_LENGTH:
+                    self.parser_state = "WAIT_LENGTH"
+                    self.header_index = 0
             else:
-                self.parser_state = "WAIT_SYNC"
+                self.header_index = 0
+                self.rx_buffer = bytearray()
+                if byte == self.HEADER_SEQUENCE[0]:
+                    self.rx_buffer.append(byte)
+                    self.header_index = 1
             return None
             
         elif self.parser_state == "WAIT_LENGTH":
             self.rx_buffer.append(byte)
             payload_length = byte
-            self.expected_length = payload_length + 4  # sync(2) + len(1) + payload + crc(1)
+            self.expected_length = self.HEADER_LENGTH + payload_length + 2
             
             if payload_length > self.MAX_PAYLOAD_SIZE:
-                self.parser_state = "WAIT_SYNC"
+                self.parser_state = "WAIT_HEADER"
                 self.rx_buffer = bytearray()
                 return None
             elif payload_length > 0:
@@ -190,17 +194,15 @@ class SensorApp:
             
         elif self.parser_state == "WAIT_DATA":
             self.rx_buffer.append(byte)
-            
-            if len(self.rx_buffer) >= self.expected_length - 1:  # -1 потому что CRC еще не добавили
+            if len(self.rx_buffer) >= self.expected_length - 1:
                 self.parser_state = "WAIT_CRC"
             return None
             
         elif self.parser_state == "WAIT_CRC":
             self.rx_buffer.append(byte)
-            
-            # Теперь у нас полный пакет
             packet_data = bytes(self.rx_buffer)
-            self.parser_state = "WAIT_SYNC"
+            
+            self.parser_state = "WAIT_HEADER"
             self.rx_buffer = bytearray()
             
             payload, error = self.parse_packet(packet_data)
@@ -223,7 +225,6 @@ class SensorApp:
             self.serial_port.write(packet)
             self.serial_port.flush()
             
-            # Логируем для отладки
             self.log_message(f"📤 Отправлен пакет: {packet.hex(' ')}")
             self.log_message(f"   Payload: {payload.hex(' ')}")
             
@@ -232,145 +233,385 @@ class SensorApp:
             self.log_message(f"❌ Ошибка отправки: {str(e)}")
             return False
 
-    def read_serial_data(self):
-        """Чтение данных из порта"""
-        while self.running:
-            try:
-                if not self.serial_port or not hasattr(self.serial_port, 'is_open') or not self.serial_port.is_open:
-                    time.sleep(1)
-                    continue
-                    
-                # Читаем все доступные данные
-                if self.serial_port.in_waiting > 0:
-                    data = self.serial_port.read(self.serial_port.in_waiting)
-                    
-                    # Логируем сырые данные
-                    self.log_message(f"📨 Получено {len(data)} байт: {data.hex(' ')}")
-                    
-                    # Обрабатываем каждый байт
-                    for byte in data:
-                        payload = self.process_received_byte(byte)
-                        if payload is not None:
-                            self.process_payload(payload)
-                            
-            except (serial.SerialException, OSError) as e:
-                if self.running:
-                    self.log_message(f"Ошибка чтения порта: {str(e)}")
-                time.sleep(1)
-            except Exception as e:
-                if self.running:
-                    self.log_message(f"Ошибка в потоке чтения: {str(e)}")
-                time.sleep(1)
-                
-            time.sleep(0.01)
+    def build_command_payload(self, command_name, parameter=None):
+        """Построение payload для команды (Big-endian)"""
+        if command_name not in self.UART_COMMANDS:
+            raise ValueError(f"Unknown command: {command_name}")
+        
+        command_code = self.UART_COMMANDS[command_name]
+        
+        # Big-endian command code (MSB first, LSB second)
+        payload = bytearray([
+            (command_code >> 8) & 0xFF,    # MSB
+            command_code & 0xFF            # LSB
+        ])
+        
+        # Add parameter if needed
+        if parameter is not None:
+            payload.extend(parameter)
+        
+        return bytes(payload)
 
-    def process_payload(self, payload):
-        """Обработка распарсенного payload"""
+    def request_sensor_count(self):
+        """Запрос количества датчиков"""
+        payload = self.build_command_payload("UART_CMD_GET_SENSOR_COUNT")
+        if self.send_packet(payload):
+            self.log_message("📊 Запрос количества датчиков")
+
+    def request_sensors_info(self):
+        """Запрос информации о датчиках"""
+        payload = self.build_command_payload("UART_CMD_GET_SENSORS_INFO")
+        if self.send_packet(payload):
+            self.log_message("📋 Запрос информации о датчиках")
+
+    def request_sensors_value(self):
+        """Запрос значений всех датчиков"""
+        payload = self.build_command_payload("UART_CMD_GET_SENSORS_VALUE")
+        if self.send_packet(payload):
+            self.log_message("📡 Запрос значений датчиков")
+
+    def request_faults_info(self):
+        """Запрос информации об уставках"""
+        payload = self.build_command_payload("UART_CMD_GET_FAULTS_INFO")
+        if self.send_packet(payload):
+            self.log_message("⚡ Запрос информации об уставках")
+
+    def send_fault_value(self, sensor_index, fault_value, is_fault_on):
+        """Отправка уставки для датчика"""
+        # Формируем параметры: [флаг_включения, MSB_значения, LSB_значения]
+        parameter = bytearray([
+            int(is_fault_on),  # Флаг включения (0/1)
+            (fault_value >> 8) & 0xFF,  # MSB значения
+            fault_value & 0xFF          # LSB значения
+        ])
+        
+        # Команда SET_FAULT_VALUE для конкретного датчика
+        command_code = self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"] + sensor_index
+        command_name = f"UART_CMD_SET_FAULT_VALUE_{sensor_index}"
+        
+        payload = self.build_command_payload("UART_CMD_SET_FAULT_VALUE", parameter)
+        if self.send_packet(payload):
+            self.log_message(f"⚡ Отправка уставки для датчика {sensor_index}: значение={fault_value}, включено={is_fault_on}")
+
+    def process_received_packet(self, payload):
+        """Обработка принятого пакета"""
         self.last_alive_time = time.time() * 1000
         
         if len(payload) < 2:
             self.log_message("⚠️ Слишком короткий payload")
             return
             
-        # Извлекаем код команды (little-endian)
-        cmd_code = payload[0] | (payload[1] << 8)
+        # Big-endian command code (MSB first, LSB second)
+        cmd_code = (payload[0] << 8) | payload[1]
+        
         self.log_message(f"🔍 Обработка команды: 0x{cmd_code:04X}")
         
-        # Обработка ответа с количеством датчиков (0x0002)
-        if cmd_code == 0x0002 and len(payload) >= 3:
-            new_sensors_count = payload[2]
+        # Обработка NACK
+        if cmd_code == self.UART_COMMANDS["UART_CMD_NACK"]:
+            self.process_nack(payload)
+            return
+            
+        # Обработка Alive
+        if cmd_code == self.UART_COMMANDS["UART_CMD_ALIVE"]:
+            self.log_message("💓 Получен Alive ответ")
+            return
+            
+        # Обработка количества датчиков
+        if cmd_code == self.UART_COMMANDS["UART_CMD_GET_SENSOR_COUNT"]:
+            self.process_sensor_count(payload)
+            return
+            
+        # Обработка информации о датчиках
+        if cmd_code == self.UART_COMMANDS["UART_CMD_GET_SENSORS_INFO"]:
+            self.process_sensors_info(payload)
+            return
+            
+        # Обработка значений датчиков
+        if cmd_code == self.UART_COMMANDS["UART_CMD_GET_SENSORS_VALUE"]:
+            self.process_sensors_value(payload)
+            return
+            
+        # Обработка информации об уставках
+        if cmd_code == self.UART_COMMANDS["UART_CMD_GET_FAULTS_INFO"]:
+            self.process_faults_info(payload)
+            return
+            
+        # Обработка SET_FAULT_VALUE ответа
+        if cmd_code >= self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"] and \
+           cmd_code < (self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"] + self.sensors_count):
+            self.process_set_fault_response(payload, cmd_code)
+            return
+            
+        self.log_message(f"⚠️ Неизвестная команда: 0x{cmd_code:04X}")
+
+    def process_nack(self, payload):
+        """Обработка NACK"""
+        if len(payload) >= 4:
+            nack_code = (payload[2] << 8) | payload[3]
+            nack_messages = {
+                0: "Неопределенная ошибка",
+                1: "Неверная команда",
+                2: "Устройство занято", 
+                3: "Неверный параметр",
+                4: "Внутренняя ошибка"
+            }
+            error_msg = nack_messages.get(nack_code, f"Неизвестная ошибка (код: {nack_code})")
+            self.log_message(f"❌ NACK: {error_msg}")
+        else:
+            self.log_message("❌ NACK: некорректный формат")
+
+    def process_sensor_count(self, payload):
+        """Обработка ответа с количеством датчиков"""
+        if len(payload) >= 4:
+            new_sensors_count = (payload[2] << 8) | payload[3]
             self.log_message(f"📊 Получено количество датчиков: {new_sensors_count}")
             
             if new_sensors_count != self.sensors_count:
                 self.sensors_count = new_sensors_count
                 self.initialize_sensor_system()
-            return
-            
-        # Обработка данных датчика (0x0003)
-        if cmd_code == 0x0003 and len(payload) >= 15:
-            self.process_sensor_data(payload)
-            return
-            
-        # Обработка Alive-сообщения (0x0001)
-        if cmd_code == 0x0001:
-            self.log_message("💓 Получен Alive ответ от устройства")
-            return
-            
-        # Обработка ответа на SET_MODE (0x0064)
-        if cmd_code == 0x0064 and len(payload) >= 4:
-            mode_value = payload[2] | (payload[3] << 8)
-            self.process_mode_response(mode_value, "SET_MODE")
-            return
-            
-        # Обработка ответа на GET_MODE (0x0004)
-        if cmd_code == 0x0004 and len(payload) >= 4:
-            mode_value = payload[2] | (payload[3] << 8)
-            self.process_mode_response(mode_value, "GET_MODE")
-            return
-            
-        # Обработка NACK ответа (0x0000)
-        if cmd_code == 0x0000 and len(payload) >= 4:
-            nack_code = payload[2] | (payload[3] << 8)
-            self.process_nack(nack_code)
-            return
-            
-        self.log_message(f"⚠️ Неизвестная команда: 0x{cmd_code:04X}")
+            else:
+                self.log_message("ℹ️ Количество датчиков не изменилось")
+        else:
+            self.log_message("⚠️ Неверный формат ответа количества датчиков")
 
-    def process_sensor_data(self, payload):
-        """Обработка данных датчика"""
-        try:
-            sensor_index = payload[2] | (payload[3] << 8)
-            sensor_type = payload[4]
-            value = payload[5] | (payload[6] << 8)
-            gain = payload[7] | (payload[8] << 8)
-            offset = payload[9] | (payload[10] << 8)
-            is_valid = payload[11]
-            location = payload[12]
-            is_fault_detection = payload[13]
-            fault_level = payload[14] | (payload[15] << 8)
+    def process_sensors_info(self, payload):
+        """Обработка информации о датчиках"""
+        if len(payload) < 3:
+            self.log_message("⚠️ Неверный формат информации о датчиках")
+            return
             
-            self.sensor_data[sensor_index] = {
-                'type': sensor_type,
-                'value': value,
-                'gain': gain,
-                'offset': offset,
-                'is_valid': is_valid,
-                'location': location,
-                'is_fault_detection': is_fault_detection,
-                'fault_level': fault_level
+        # Пропускаем 2 байта команды
+        data = payload[2:]
+        sensor_count = len(data) // 6  # 6 байт на датчик: location(1) + type(1) + gain(2) + offset(2)
+        
+        self.log_message(f"📋 Получена информация о {sensor_count} датчиках")
+        
+        for i in range(sensor_count):
+            start_idx = i * 6
+            if start_idx + 5 < len(data):
+                location = data[start_idx]
+                sensor_type = data[start_idx + 1]
+                gain = (data[start_idx + 2] << 8) | data[start_idx + 3]
+                offset = (data[start_idx + 4] << 8) | data[start_idx + 5]
+                
+                self.sensor_info[i] = {
+                    'location': location,
+                    'type': sensor_type,
+                    'gain': gain,
+                    'offset': offset
+                }
+                
+                self.log_message(f"   Датчик {i}: тип={self.sensor_types.get(sensor_type, 'UNKNOWN')}, " +
+                               f"расположение={self.sensor_locations.get(location, 'UNKNOWN')}, " +
+                               f"усиление={gain}, смещение={offset}")
+        
+        # Обновляем отображение
+        self.root.after(0, self.update_sensor_displays)
+
+    def process_sensors_value(self, payload):
+        """Обработка значений датчиков"""
+        if len(payload) < 3:
+            self.log_message("⚠️ Неверный формат значений датчиков")
+            return
+            
+        # Пропускаем 2 байта команды
+        data = payload[2:]
+        sensor_count = len(data) // 2  # 2 байта на значение
+        
+        self.log_message(f"📡 Получены значения {sensor_count} датчиков")
+        
+        for i in range(sensor_count):
+            start_idx = i * 2
+            if start_idx + 1 < len(data):
+                value = (data[start_idx] << 8) | data[start_idx + 1]
+                
+                # Маркер невалидных данных
+                if value == 0xFFFF:
+                    self.log_message(f"   Датчик {i}: НЕВАЛИДНЫЕ ДАННЫЕ")
+                    if i in self.sensor_data:
+                        self.sensor_data[i]['is_valid'] = False
+                else:
+                    if i not in self.sensor_data:
+                        self.sensor_data[i] = {}
+                    
+                    self.sensor_data[i]['value'] = value
+                    self.sensor_data[i]['is_valid'] = True
+                    
+                    # Добавляем информацию из sensor_info если есть
+                    if i in self.sensor_info:
+                        self.sensor_data[i].update(self.sensor_info[i])
+                    
+                    self.log_message(f"   Датчик {i}: значение={value}")
+        
+        # Обновляем отображение
+        self.root.after(0, self.update_sensor_displays)
+
+    def process_faults_info(self, payload):
+        """Обработка информации об уставках"""
+        if len(payload) < 3:
+            self.log_message("⚠️ Неверный формат информации об уставках")
+            return
+            
+        # Пропускаем 2 байта команды
+        data = payload[2:]
+        sensor_count = len(data) // 4  # 4 байта на датчик: пустой(1) + флаг(1) + уровень(2)
+        
+        self.log_message(f"⚡ Получена информация об уставках {sensor_count} датчиков")
+        
+        for i in range(sensor_count):
+            start_idx = i * 4
+            if start_idx + 3 < len(data):
+                is_fault_detection = data[start_idx + 1]  # Пропускаем пустой байт
+                fault_level = (data[start_idx + 2] << 8) | data[start_idx + 3]
+                
+                if i not in self.sensor_data:
+                    self.sensor_data[i] = {}
+                
+                self.sensor_data[i]['is_fault_detection'] = bool(is_fault_detection)
+                self.sensor_data[i]['fault_level'] = fault_level
+                
+                # Добавляем информацию из sensor_info если есть
+                if i in self.sensor_info:
+                    self.sensor_data[i].update(self.sensor_info[i])
+                
+                self.log_message(f"   Датчик {i}: детекция={'ON' if is_fault_detection else 'OFF'}, уровень={fault_level}")
+        
+        # Обновляем отображение
+        self.root.after(0, self.update_sensor_displays)
+        
+        # Автоматически запускаем опрос после получения всей информации
+        self.root.after(500, self.start_sensor_polling)
+
+    def update_sensor_displays(self):
+        """Обновление отображения всех датчиков"""
+        for sensor_index in range(self.sensors_count):
+            self.update_sensor_display(sensor_index)
+
+    def update_sensor_display(self, sensor_index):
+        """Обновление отображения конкретного датчика"""
+        if sensor_index in self.sensor_widgets and sensor_index in self.sensor_data:
+            widgets = self.sensor_widgets[sensor_index]
+            data = self.sensor_data[sensor_index]
+            
+            # Basic info
+            sensor_type = data.get('type', 0)
+            location = data.get('location', 0)
+            value = data.get('value', 0)
+            gain = data.get('gain', 1)
+            offset = data.get('offset', 0)
+            is_valid = data.get('is_valid', False)
+            is_fault_detection = data.get('is_fault_detection', False)
+            fault_level = data.get('fault_level', 0)
+            
+            # Units for display
+            units = {
+                1: "°C",  # TEMPERATURE
+                2: "kPa", # PRESSURE  
+                3: "%",   # HUMIDITY
+                4: "μg/m³" # DUST
             }
+            unit = units.get(sensor_type, "")
             
-            self.log_message(f"📡 Данные датчика {sensor_index}: значение={value}")
-            self.root.after(0, lambda idx=sensor_index: self.update_sensor_display(idx))
+            # Calculate processed value
+            if gain != 0:
+                processed_value = (value / gain) - offset
+            else:
+                processed_value = 0
             
-        except Exception as e:
-            self.log_message(f"❌ Ошибка обработки данных датчика: {str(e)}")
+            # Update widgets
+            widgets['type'].config(text=self.sensor_types.get(sensor_type, "UNKNOWN"))
+            widgets['location'].config(text=self.sensor_locations.get(location, "UNKNOWN"))
+            widgets['value'].config(text=f"{value} (raw)")
+            widgets['gain'].config(text=f"{gain}")
+            widgets['offset'].config(text=f"{offset}")
+            widgets['processed'].config(text=f"{processed_value:.2f} {unit}")
+            widgets['status'].config(
+                text="VALID" if is_valid else "INVALID",
+                fg="green" if is_valid else "red"
+            )
+            widgets['fault_detection'].config(
+                text="ON" if is_fault_detection else "OFF",
+                fg="green" if is_fault_detection else "red"
+            )
+            
+            # Update fault level with processed value if possible
+            if gain != 0:
+                processed_fault = (fault_level / gain) - offset
+                widgets['fault_level'].config(text=f"{processed_fault:.2f} {unit}")
+            else:
+                widgets['fault_level'].config(text=f"{fault_level} (raw)")
+            
+            # Update fault control
+            if 'fault_detection_var' in widgets:
+                widgets['fault_detection_var'].set(is_fault_detection)
+                widgets['fault_entry'].delete(0, tk.END)
+                widgets['fault_entry'].insert(0, str(fault_level))
 
-    def process_mode_response(self, mode_value, response_type):
-        """Обработка ответа режима"""
-        mode_name = self.device_modes.get(mode_value, f"UNKNOWN ({mode_value})")
-        
-        self.current_mode = mode_value
-        self.mode_status_label.config(text=f"Текущий: {mode_name}")
-        self.update_mode_combobox(mode_value)
-        self.log_message(f"📊 {response_type}: режим {mode_name}")
-        
-        # Для отладки синхронизации
-        if hasattr(self, 'expected_mode') and self.expected_mode is not None:
-            if mode_value == self.expected_mode:
-                self.log_message("🎯 Режим совпадает с ожидаемым!")
+    def start_sensor_polling(self):
+        """Запуск опроса датчиков"""
+        if not self.connected:
+            return
+            
+        self.polling_active = True
+        self.start_poll_btn.config(state=tk.DISABLED)
+        self.stop_poll_btn.config(state=tk.NORMAL)
+        self.log_message("🔁 Запуск опроса датчиков")
+        self.poll_sensors()
 
-    def process_nack(self, nack_code):
-        """Обработка NACK"""
-        nack_messages = {
-            1: "Неверная команда",
-            2: "Устройство занято", 
-            3: "Неверный параметр"
-        }
-        error_msg = nack_messages.get(nack_code, f"Неизвестная ошибка (код: {nack_code})")
+    def poll_sensors(self):
+        """Опрос датчиков"""
+        if not self.polling_active or not self.connected:
+            return
+            
+        self.request_sensors_value()
+        self.root.after(self.polling_interval, self.poll_sensors)
+
+    def process_sensors_value(self, payload):
+        """Обработка значений датчиков"""
+        if len(payload) < 3:
+            self.log_message("⚠️ Неверный формат значений датчиков")
+            return
+            
+        # Пропускаем 2 байта команды
+        data = payload[2:]
+        sensor_count = len(data) // 2  # 2 байта на значение
         
-        self.log_message(f"❌ NACK: {error_msg}")
-        self.received_nack = True
+        self.log_message(f"📡 Получены значения {sensor_count} датчиков")
+        
+        for i in range(sensor_count):
+            start_idx = i * 2
+            if start_idx + 1 < len(data):
+                value = (data[start_idx] << 8) | data[start_idx + 1]
+                
+                # Маркер невалидных данных
+                if value == 0xFFFF:
+                    self.log_message(f"   Датчик {i}: НЕВАЛИДНЫЕ ДАННЫЕ")
+                    if i in self.sensor_data:
+                        self.sensor_data[i]['is_valid'] = False
+                else:
+                    if i not in self.sensor_data:
+                        self.sensor_data[i] = {}
+                    
+                    self.sensor_data[i]['value'] = value
+                    self.sensor_data[i]['is_valid'] = True
+                    
+                    # Добавляем информацию из sensor_info если есть
+                    if i in self.sensor_info:
+                        self.sensor_data[i].update(self.sensor_info[i])
+                    
+                    self.log_message(f"   Датчик {i}: значение={value}")
+        
+        # Обновляем отображение
+        self.root.after(0, self.update_sensor_displays)
+
+    def process_set_fault_response(self, payload, cmd_code):
+        """Обработка ответа на установку уставки"""
+        sensor_index = cmd_code - self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"]
+        
+        if len(payload) >= 3 and payload[2] == 1:  # Статус успеха
+            self.log_message(f"✅ Уставка для датчика {sensor_index} успешно установлена")
+        else:
+            self.log_message(f"❌ Ошибка установки уставки для датчика {sensor_index}")
 
     def create_widgets(self):
         main_frame = tk.Frame(self.root)
@@ -388,6 +629,12 @@ class SensorApp:
         self.port_combobox = ttk.Combobox(com_frame, state="readonly", width=15)
         self.port_combobox.pack(side=tk.LEFT, padx=5)
         
+        tk.Label(com_frame, text="Скорость:").pack(side=tk.LEFT, padx=(10,0))
+        self.baud_combobox = ttk.Combobox(com_frame, values=["9600", "19200", "38400", "57600", "115200"], 
+                                         state="readonly", width=10)
+        self.baud_combobox.set("9600")
+        self.baud_combobox.pack(side=tk.LEFT, padx=5)
+        
         self.connect_btn = tk.Button(com_frame, text="Подключиться", command=self.connect_to_port)
         self.connect_btn.pack(side=tk.LEFT, padx=5)
         
@@ -398,40 +645,21 @@ class SensorApp:
         self.refresh_btn = tk.Button(com_frame, text="Обновить список", command=self.update_ports_list)
         self.refresh_btn.pack(side=tk.LEFT)
         
-        # Mode control
-        mode_frame = tk.Frame(control_frame)
-        mode_frame.pack(fill=tk.X, pady=2)
+        # Control buttons frame
+        btn_frame = tk.Frame(control_frame)
+        btn_frame.pack(fill=tk.X, pady=2)
         
-        tk.Label(mode_frame, text="Режим:").pack(side=tk.LEFT)
+        self.get_sensors_btn = tk.Button(btn_frame, text="Запросить датчики", 
+                                       command=self.request_initial_config, state=tk.DISABLED)
+        self.get_sensors_btn.pack(side=tk.LEFT, padx=5)
         
-        self.mode_combobox = ttk.Combobox(mode_frame, values=list(self.device_modes.values()), 
-                                         state="readonly", width=12)
-        self.mode_combobox.set("NORMAL_0")  # Значение по умолчанию
-        self.mode_combobox.pack(side=tk.LEFT, padx=5)
+        self.start_poll_btn = tk.Button(btn_frame, text="Старт опроса", 
+                                      command=self.start_sensor_polling, state=tk.DISABLED)
+        self.start_poll_btn.pack(side=tk.LEFT, padx=5)
         
-        self.set_mode_btn = tk.Button(mode_frame, text="Установить режим", 
-                                    command=self.set_device_mode, state=tk.DISABLED)
-        self.set_mode_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.get_mode_btn = tk.Button(mode_frame, text="Получить режим",
-                                    command=self.get_device_mode, state=tk.DISABLED)
-        self.get_mode_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.mode_status_label = tk.Label(mode_frame, text="Текущий: ---", fg="blue")
-        self.mode_status_label.pack(side=tk.LEFT, padx=10)
-        
-        # RTS control frame
-        rts_frame = tk.Frame(control_frame)
-        rts_frame.pack(fill=tk.X, pady=2)
-        
-        tk.Label(rts_frame, text="RTS пин:").pack(side=tk.LEFT)
-        
-        self.rts_btn = tk.Button(rts_frame, text="RTS: ВЫКЛ", 
-                               command=self.toggle_rts, 
-                               state=tk.DISABLED,
-                               bg="light gray",
-                               width=10)
-        self.rts_btn.pack(side=tk.LEFT, padx=5)
+        self.stop_poll_btn = tk.Button(btn_frame, text="Стоп опроса", 
+                                     command=self.stop_sensor_polling, state=tk.DISABLED)
+        self.stop_poll_btn.pack(side=tk.LEFT, padx=5)
         
         # Status label
         status_frame = tk.Frame(control_frame)
@@ -452,7 +680,12 @@ class SensorApp:
         self.notebook.add(self.system_tab, text="Система")
         
         self.system_text = tk.Text(self.system_tab, wrap=tk.WORD)
-        self.system_text.pack(fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(self.system_tab, command=self.system_text.yview)
+        self.system_text.config(yscrollcommand=scrollbar.set)
+        
+        self.system_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
         self.system_text.insert(tk.END, "Ожидание подключения к устройству...\n")
         self.system_text.config(state=tk.DISABLED)
         
@@ -462,416 +695,358 @@ class SensorApp:
         self.context_menu.add_command(label="Очистить лог", command=self.clear_log)
         self.system_text.bind("<Button-3>", self.show_context_menu)
 
-    def toggle_rts(self):
-        """Переключение состояния RTS пина (INVERTED: HIGH = устройство OFF, LOW = устройство ON)"""
-        if not self.connected or not self.serial_port or not self.serial_port.is_open:
-            messagebox.showerror("Ошибка", "Нет подключения к устройству")
+    def create_sensor_tabs(self):
+        """Создание вкладок для датчиков"""
+        if not hasattr(self, 'notebook'):
             return
             
-        try:
-            # Переключаем состояние (инвертированная логика)
-            self.rts_state = not self.rts_state
-            self.serial_port.rts = self.rts_state
-            
-            # Даем время на установку состояния
-            time.sleep(0.05)
-            
-            # Читаем ФАКТИЧЕСКОЕ состояние пина
-            actual_rts_state = self.serial_port.rts
-            
-            # Обновляем внутреннее состояние по фактическому состоянию
-            self.rts_state = actual_rts_state
-            
-            # ИНВЕРТИРОВАННАЯ логика: HIGH = устройство OFF, LOW = устройство ON
-            if actual_rts_state:  # HIGH
-                self.rts_btn.config(text="RTS: OFF", bg="light gray")
-                self.log_message("🔴 Устройство ВЫКЛЮЧЕНО (RTS=HIGH)")
-            else:  # LOW
-                self.rts_btn.config(text="RTS: ON", bg="light green")
-                self.log_message("✅ Устройство ВКЛЮЧЕНО (RTS=LOW)")
-                
-            # Логируем для отладки
-            self.log_message(f"🔍 Состояние RTS пина: {actual_rts_state} (HIGH=OFF, LOW=ON)")
-                    
-        except Exception as e:
-            self.log_message(f"❌ Ошибка управления RTS: {str(e)}")
-            messagebox.showerror("Ошибка", f"Не удалось установить RTS: {str(e)}")
-
-    def update_rts_button_state(self):
-        """Обновление состояния кнопки RTS на основе фактического состояния пина (инвертированная логика)"""
-        if not self.connected or not self.serial_port or not self.serial_port.is_open:
-            return
-            
-        try:
-            # Читаем текущее состояние RTS
-            actual_rts_state = self.serial_port.rts
-            self.rts_state = actual_rts_state
-            
-            # ИНВЕРТИРОВАННАЯ логика: HIGH = устройство OFF, LOW = устройство ON
-            if actual_rts_state:
-                self.rts_btn.config(text="RTS: OFF", bg="light gray")
-            else:
-                self.rts_btn.config(text="RTS: ON", bg="light green")
-                
-        except Exception as e:
-            self.log_message(f"⚠️ Не удалось прочитать состояние RTS: {str(e)}")
-
-    def update_mode_combobox(self, mode_value):
-        """Обновление combobox в соответствии с текущим режимом устройства"""
-        mode_name = self.device_modes.get(mode_value, "UNKNOWN")
-        
-        # Защита от установки несуществующего режима
-        if mode_name == "UNKNOWN":
-            self.log_message(f"⚠️ Получен неизвестный режим: {mode_value}")
-            return
-            
-        # Обновляем combobox только если значение изменилось
-        if self.mode_combobox.get() != mode_name:
-            self.mode_combobox.set(mode_name)
-            self.log_message(f"Combobox обновлен на: {mode_name}")
-
-    def set_device_mode(self):
-        """Установка нового режима работы устройства"""
-        if not self.connected or not self.serial_port or not self.serial_port.is_open:
-            messagebox.showerror("Ошибка", "Нет подключения к устройству")
-            return
-            
-        selected_mode_name = self.mode_combobox.get()
-        mode_value = None
-        
-        for value, name in self.device_modes.items():
-            if name == selected_mode_name:
-                mode_value = value
-                break
-                
-        if mode_value is None:
-            messagebox.showerror("Ошибка", "Неверный режим")
-            return
-            
-        # Дополнительная проверка - не пытаемся установить тот же режим
-        if mode_value == self.current_mode:
-            self.log_message(f"ℹ️ Устройство уже находится в режиме {selected_mode_name}")
-            return
-            
-        # ПРИНУДИТЕЛЬНЫЙ СБРОС ДАННЫХ ПЕРЕД СМЕНОЙ РЕЖИМА
-        self.log_message("🔄 Подготовка к смене режима...")
-        self.polling_active = False
-        self.sensor_data = {}
-        self.sensors_count = 0
-        self.current_sensor_index = 0
-        
-        # Формируем команду SET_MODE (0x0064)
-        payload = bytes([
-            0x64, 0x00,  # Command code
-            (mode_value & 0xFF),
-            ((mode_value >> 8) & 0xFF)
-        ])
-        
-        if self.send_packet(payload):
-            self.log_message(f"🔄 Отправлен запрос смены режима на: {selected_mode_name} (код: {mode_value})")
-            
-            # Запускаем синхронную проверку смены режима
-            self.start_mode_verification(mode_value, selected_mode_name)
-
-    def start_mode_verification(self, expected_mode, mode_name):
-        """Запуск цикла проверки смены режима"""
-        self.mode_verification_count = 0
-        self.expected_mode = expected_mode
-        self.expected_mode_name = mode_name
-        self.received_nack = False
-        self.log_message(f"🔍 Начало проверки смены режима на: {mode_name}")
-        
-        self.verify_mode_change()
-
-    def verify_mode_change(self):
-        """Проверка текущего режима устройства"""
-        if self.mode_verification_count >= 15 or self.received_nack:
-            if self.received_nack:
-                self.log_message("❌ ОШИБКА: Устройство отвергло запрос смены режима")
-                # Восстанавливаем предыдущий режим в combobox
-                self.update_mode_combobox(self.current_mode)
-                self.mode_status_label.config(text=f"Текущий: {self.device_modes.get(self.current_mode, 'UNKNOWN')}", fg="red")
-                messagebox.showerror("Ошибка", "Устройство отвергло запрос смены режима\nВозможно выбран недопустимый режим")
-            else:
-                self.log_message("❌ ТАЙМАУТ: Режим не подтвержден после 15 попыток")
-                self.mode_status_label.config(text="Текущий: ---", fg="red")
-                
-                # Сбрасываем данные только при таймауте (режим неизвестен)
-                self.sensor_data = {}
-                self.sensors_count = 0
-                self.current_sensor_index = 0
-                
-                # Удаляем старые вкладки датчиков
-                for tab in self.notebook.tabs()[1:]:
-                    self.notebook.forget(tab)
-            return
-            
-        self.mode_verification_count += 1
-        self.log_message(f"🔄 Проверка режима [{self.mode_verification_count}/15]...")
-        
-        # Запрашиваем текущий режим
-        self.request_device_mode()
-        
-        # Проверяем через 300мс
-        self.root.after(300, self.check_mode_confirmation)
-
-    def check_mode_confirmation(self):
-        """Проверка подтверждения смены режима"""
-        if self.received_nack:
-            return  # Прерываем если получили NACK
-            
-        if self.current_mode == self.expected_mode:
-            self.log_message(f"✅ Режим подтвержден: {self.expected_mode_name}")
-            self.mode_status_label.config(text=f"Текущий: {self.expected_mode_name}", fg="green")
-            
-            # ТОЛЬКО ПОСЛЕ ПОДТВЕРЖДЕНИЯ запрашиваем конфигурацию
-            self.root.after(1000, self.request_new_configuration_after_mode_change)
-        else:
-            # Продолжаем проверку
-            self.verify_mode_change()
-
-    def request_new_configuration_after_mode_change(self):
-        """Запрос новой конфигурации ПОСЛЕ подтверждения смены режима"""
-        self.log_message("📋 Запрос новой конфигурации устройства...")
-        
-        # Сбрасываем данные
-        self.sensor_data = {}
-        self.sensors_count = 0
-        self.current_sensor_index = 0
-        
         # Удаляем старые вкладки датчиков
         for tab in self.notebook.tabs()[1:]:
             self.notebook.forget(tab)
         
-        # ДАЕМ ВРЕМЯ УСТРОЙСТВУ НА ПЕРЕКОНФИГУРАЦИЮ (1 секунда)
-        self.log_message("⏳ Ожидание переконфигурации устройства...")
-        self.root.after(1000, self.request_sensor_count_after_mode_change)
-
-    def request_sensor_count_after_mode_change(self):
-        """Запрос количества датчиков после смены режима"""
-        self.request_sensor_count()
+        self.sensor_widgets = {}
         
-        # Если через 2 секунды количество датчиков не получено, пробуем еще раз
-        self.root.after(2000, self.retry_sensor_count_request)
-
-    def retry_sensor_count_request(self):
-        """Повторный запрос количества датчиков если не получен"""
-        if self.sensors_count == 0 and self.polling_active:
-            self.log_message("🔄 Повторный запрос количества датчиков...")
-            self.request_sensor_count()
+        for i in range(self.sensors_count):
+            tab = ttk.Frame(self.notebook)
+            self.notebook.add(tab, text=f"Датчик {i}")
             
-            # Еще одна попытка через 2 секунды
-            self.root.after(2000, self.final_sensor_count_check)
+            # Main sensor frame
+            main_frame = tk.Frame(tab)
+            main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            # Sensor data frame
+            data_frame = ttk.LabelFrame(main_frame, text=f"Данные датчика {i}", padding=10)
+            data_frame.pack(fill=tk.X, pady=5)
+            
+            # Fault control frame
+            fault_frame = ttk.LabelFrame(main_frame, text="Управление уставками", padding=10)
+            fault_frame.pack(fill=tk.X, pady=5)
+            
+            self.create_sensor_display(data_frame, fault_frame, i)
 
-    def final_sensor_count_check(self):
-        """Финальная проверка количества датчиков"""
-        if self.sensors_count == 0:
-            self.log_message("⚠️ В новом режиме количество датчиков = 0")
-        # Все равно запускаем опрос
-        self.start_sensor_polling()
+    def create_sensor_display(self, data_frame, fault_frame, sensor_index):
+        """Создание отображения для датчика"""
+        sensor_widgets = {}
+        
+        # Data display
+        labels_info = [
+            ("Тип:", 'type'),
+            ("Расположение:", 'location'), 
+            ("Значение:", 'value'),
+            ("Усиление:", 'gain'),
+            ("Смещение:", 'offset'),
+            ("Результат:", 'processed'),
+            ("Статус:", 'status'),
+            ("Детекция ошибок:", 'fault_detection'),
+            ("Уровень ошибки:", 'fault_level')
+        ]
+        
+        for row, (label_text, key) in enumerate(labels_info):
+            tk.Label(data_frame, text=label_text, anchor='w').grid(row=row, column=0, sticky=tk.W, pady=2)
+            sensor_widgets[key] = tk.Label(data_frame, text="---", anchor='w')
+            sensor_widgets[key].grid(row=row, column=1, sticky=tk.W, padx=10)
+        
+        # Fault control
+        tk.Label(fault_frame, text="Новая уставка:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        sensor_widgets['fault_entry'] = tk.Entry(fault_frame, width=10)
+        sensor_widgets['fault_entry'].grid(row=0, column=1, padx=5, pady=2)
+        
+        sensor_widgets['fault_detection_var'] = tk.BooleanVar()
+        sensor_widgets['fault_checkbox'] = tk.Checkbutton(fault_frame, text="Включить детектирование",
+                                                        variable=sensor_widgets['fault_detection_var'])
+        sensor_widgets['fault_checkbox'].grid(row=0, column=2, padx=10, pady=2)
+        
+        sensor_widgets['fault_button'] = tk.Button(fault_frame, text="Установить уставку",
+                                                 command=lambda idx=sensor_index: self.send_fault_setting(idx))
+        sensor_widgets['fault_button'].grid(row=0, column=3, padx=5, pady=2)
+        
+        self.sensor_widgets[sensor_index] = sensor_widgets
 
-    def request_device_mode(self):
-        """Запрос текущего режима работы устройства"""
-        if not self.connected or not self.serial_port or not self.serial_port.is_open:
+    def send_fault_setting(self, sensor_index):
+        """Отправка новой уставки для датчика"""
+        if sensor_index not in self.sensor_widgets:
             return
             
-        payload = bytes([0x04, 0x00])  # Command code 0x0004
-        if self.send_packet(payload):
-            self.log_message("📊 Запрос текущего режима устройства")
-
-    def get_device_mode(self):
-        """Запрос текущего режима работы устройства (ручной)"""
-        self.request_device_mode()
-
-    def check_alive_status(self):
-        if self.connected and self.serial_port and self.serial_port.is_open:
-            current_time = time.time() * 1000
-            time_diff = current_time - self.last_alive_time
+        widgets = self.sensor_widgets[sensor_index]
+        
+        try:
+            fault_value = int(widgets['fault_entry'].get())
+            is_fault_on = widgets['fault_detection_var'].get()
             
-            if time_diff > self.alive_timeout:
-                self.alive_status.config(text="[ALIVE: NO RESPONSE]", fg="red")
-                self.log_message("Ошибка: Устройство не отвечает (Alive timeout)")
-                self.reset_sensor_values()
-            else:
-                self.alive_status.config(text="[ALIVE: OK]", fg="green")
-        
-        self.root.after(self.alive_check_interval, self.check_alive_status)
+            self.send_fault_value(sensor_index, fault_value, is_fault_on)
+            
+        except ValueError:
+            messagebox.showerror("Ошибка", "Введите корректное числовое значение уставки")
 
-    def reset_sensor_values(self):
-        for sensor_index in self.sensor_widgets:
+    def update_sensor_displays(self):
+        """Обновление отображения всех датчиков"""
+        for sensor_index in range(self.sensors_count):
+            self.update_sensor_display(sensor_index)
+
+    def update_sensor_display(self, sensor_index):
+        """Обновление отображения конкретного датчика"""
+        if sensor_index in self.sensor_widgets and sensor_index in self.sensor_data:
             widgets = self.sensor_widgets[sensor_index]
-            widgets['type'].config(text="---")
-            widgets['location'].config(text="---")
-            widgets['value'].config(text="---")
-            widgets['gain'].config(text="---")
-            widgets['offset'].config(text="---")
-            widgets['processed'].config(text="---")
-            widgets['status'].config(text="---", fg="black")
-            widgets['fault_detection'].config(text="---", fg="black")
-            widgets['fault_level'].config(text="---")
+            data = self.sensor_data[sensor_index]
+            
+            # Basic info
+            sensor_type = data.get('type', 0)
+            location = data.get('location', 0)
+            value = data.get('value', 0)
+            gain = data.get('gain', 1)
+            offset = data.get('offset', 0)
+            is_valid = data.get('is_valid', False)
+            is_fault_detection = data.get('is_fault_detection', False)
+            fault_level = data.get('fault_level', 0)
+            
+            # Calculate processed value
+            if gain != 0 and is_valid:
+                processed_value = (value / gain) - offset
+            else:
+                processed_value = 0
+            
+            # Update widgets
+            widgets['type'].config(text=self.sensor_types.get(sensor_type, "UNKNOWN"))
+            widgets['location'].config(text=self.sensor_locations.get(location, "UNKNOWN"))
+            widgets['value'].config(text=f"{value} (raw)")
+            widgets['gain'].config(text=f"{gain}")
+            widgets['offset'].config(text=f"{offset}")
+            widgets['processed'].config(text=f"{processed_value:.2f}")
+            widgets['status'].config(
+                text="VALID" if is_valid else "INVALID",
+                fg="green" if is_valid else "red"
+            )
+            widgets['fault_detection'].config(
+                text="ON" if is_fault_detection else "OFF",
+                fg="green" if is_fault_detection else "red"
+            )
+            
+            # Update fault level with processed value if possible
+            if gain != 0:
+                processed_fault = (fault_level / gain) - offset
+                widgets['fault_level'].config(text=f"{fault_level} (raw) / {processed_fault:.2f}")
+            else:
+                widgets['fault_level'].config(text=f"{fault_level} (raw)")
+            
+            # Update fault control
+            widgets['fault_detection_var'].set(is_fault_detection)
+
+    def initialize_sensor_system(self):
+        """Инициализация системы датчиков"""
+        self.log_message(f"🚀 Инициализация системы с {self.sensors_count} датчиками")
+        self.create_sensor_tabs()
         
-        self.sensor_data = {}
-        self.log_message("Значения датчиков сброшены из-за потери связи")
+        # Запрашиваем дополнительную информацию
+        self.request_sensors_info()
+        self.request_faults_info()
 
-    def show_context_menu(self, event):
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
+    def start_sensor_polling(self):
+        """Запуск опроса датчиков"""
+        self.polling_active = True
+        self.log_message("🔁 Запуск опроса датчиков")
+        self.poll_sensors()
 
-    def copy_from_log(self):
-        try:
-            if self.system_text.tag_ranges(tk.SEL):
-                selected_text = self.system_text.get(tk.SEL_FIRST, tk.SEL_LAST)
-                self.root.clipboard_clear()
-                self.root.clipboard_append(selected_text)
-        except Exception as e:
-            self.log_message(f"Ошибка копирования: {str(e)}")
+    def stop_sensor_polling(self):
+        """Остановка опроса датчиков"""
+        self.polling_active = False
+        self.log_message("⏹️ Остановка опроса датчиков")
 
-    def clear_log(self):
-        self.system_text.config(state=tk.NORMAL)
-        self.system_text.delete(1.0, tk.END)
-        self.system_text.config(state=tk.DISABLED)
-    
-    def update_ports_list(self):
-        ports = [port.device for port in serial.tools.list_ports.comports()]
-        self.port_combobox['values'] = ports
-        if ports:
-            self.port_combobox.set(ports[0])
-        else:
-            self.port_combobox.set('')
-            self.status_label.config(text="Статус: COM-порты не найдены")
-    
+    def poll_sensors(self):
+        """Опрос датчиков"""
+        if not self.polling_active or not self.connected:
+            return
+            
+        self.request_sensors_value()
+        self.root.after(self.polling_interval, self.poll_sensors)
+
+    def request_initial_config(self):
+        """Запрос начальной конфигурации"""
+        self.log_message("📋 Запрос начальной конфигурации устройства...")
+        self.request_sensor_count()
+
+    # Остальные методы (connect_to_port, disconnect_port, log_message, etc.) 
+    # остаются практически без изменений, нужно только обновить read_serial_data
+
+    def read_serial_data(self):
+        """Чтение данных из порта"""
+        while self.running:
+            try:
+                if not self.serial_port or not hasattr(self.serial_port, 'is_open') or not self.serial_port.is_open:
+                    time.sleep(1)
+                    continue
+                    
+                if self.serial_port.in_waiting > 0:
+                    data = self.serial_port.read(self.serial_port.in_waiting)
+                    
+                    # Логируем сырые данные
+                    self.log_message(f"📨 Получено {len(data)} байт: {data.hex(' ')}")
+                    
+                    # Обрабатываем каждый байт
+                    for byte in data:
+                        payload = self.process_received_byte(byte)
+                        if payload is not None:
+                            self.process_received_packet(payload)
+                            
+            except (serial.SerialException, OSError) as e:
+                if self.running:
+                    self.log_message(f"Ошибка чтения порта: {str(e)}")
+                time.sleep(1)
+            except Exception as e:
+                if self.running:
+                    self.log_message(f"Ошибка в потоке чтения: {str(e)}")
+                time.sleep(1)
+                
+            time.sleep(0.01)
+
     def connect_to_port(self):
-        time.sleep(0.5)
-        
+        """Подключение к порту"""
         port_name = self.port_combobox.get()
+        baud_rate = self.baud_combobox.get()
+        
         if not port_name:
             messagebox.showerror("Ошибка", "Не выбран COM-порт")
             return
             
-        if self.serial_port and hasattr(self.serial_port, 'is_open'):
-            try:
-                self.serial_port.close()
-            except:
-                pass
-                
+        # Останавливаем предыдущее соединение если есть
+        if self.connected:
+            self.safe_disconnect()
+            time.sleep(0.5)  # Даем время на закрытие
+            
         try:
-            # Открываем порт с явным отключением аппаратного управления потоком
+            # Закрываем предыдущее соединение если есть
+            if self.serial_port and hasattr(self.serial_port, 'is_open'):
+                try:
+                    self.serial_port.close()
+                except:
+                    pass
+            
             self.serial_port = serial.Serial(
                 port=port_name,
-                baudrate=9600,
+                baudrate=int(baud_rate),
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 timeout=1,
-                xonxoff=False,    # Отключаем программное управление потоком
-                rtscts=False,     # ОЧЕНЬ ВАЖНО: отключаем аппаратное управление RTS/CTS
-                dsrdtr=False,     # Отключаем аппаратное управление DTR/DSR
-                write_timeout=None
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False
             )
             
             # Принудительно устанавливаем начальное состояние RTS
             self.serial_port.rts = False
             time.sleep(0.1)  # Даем время на установку состояния
-            
-            # Читаем ФАКТИЧЕСКОЕ состояние после инициализации
-            actual_rts_state = self.serial_port.rts
-            self.rts_state = actual_rts_state
+                
+            # Тестируем соединение
+            self.serial_port.reset_input_buffer()
+            self.serial_port.reset_output_buffer()
             
             self.connected = True
-            self.running = True
+            self.running = True  # ВКЛЮЧАЕМ флаг running
             self.last_alive_time = time.time() * 1000
-            self.status_label.config(text=f"Статус: Подключено к {port_name}")
-            self.alive_status.config(text="[ALIVE: ---]", fg="gray")
-            self.log_message(f"✅ Успешное подключение к {port_name}")
-            self.log_message("🔧 Порт сконфигурирован с RTSCTS=False для ручного управления RTS")
+            self.connection_ok = True
             
-            # Сбрасываем парсер
-            self.parser_state = "WAIT_SYNC"
+            self.log_message(f"✅ Подключено к {port_name} ({baud_rate} бод)")
+            
+            # Сбрасываем состояние парсера
+            self.parser_state = "WAIT_HEADER"
             self.rx_buffer = bytearray()
+            self.header_index = 0
             
-            # Обновляем кнопку по фактическому состоянию (инвертированная логика)
-            if actual_rts_state:
-                self.rts_btn.config(text="RTS: OFF", bg="light gray")
-                self.log_message("🔍 Начальное состояние: Устройство ВЫКЛЮЧЕНО (RTS=HIGH)")
-            else:
-                self.rts_btn.config(text="RTS: ON", bg="light green")
-                self.log_message("🔍 Начальное состояние: Устройство ВКЛЮЧЕНО (RTS=LOW)")
-            
-            # Проверяем состояние CTS для отладки
-            try:
-                current_cts = self.serial_port.cts
-                self.log_message(f"🔍 Состояние CTS: {current_cts}")
-            except:
-                pass
-            
-            self.connect_btn.config(state=tk.DISABLED)
-            self.disconnect_btn.config(state=tk.NORMAL)
-            self.set_mode_btn.config(state=tk.NORMAL)
-            self.get_mode_btn.config(state=tk.NORMAL)
-            self.rts_btn.config(state=tk.NORMAL)
-            self.port_combobox.config(state='disabled')
-            
-            if not self.read_thread.is_alive():
+            # Запускаем новый поток чтения если он не активен
+            if not self.read_thread or not self.read_thread.is_alive():
                 self.read_thread = Thread(target=self.read_serial_data, daemon=True)
                 self.read_thread.start()
             
-            # Запрашиваем начальную конфигурацию
-            self.request_initial_config()
+            # Обновляем UI
+            self.connect_btn.config(state=tk.DISABLED)
+            self.disconnect_btn.config(state=tk.NORMAL)
+            self.get_sensors_btn.config(state=tk.NORMAL)
+            self.port_combobox.config(state='disabled')
+            self.baud_combobox.config(state='disabled')
+            
+            self.update_status_indicator()
+            
+            # Автоматически запрашиваем конфигурацию при подключении
+            self.root.after(1000, self.request_initial_config)
             
         except Exception as e:
-            self.status_label.config(text="Статус: Ошибка подключения")
             self.log_message(f"❌ Ошибка подключения к {port_name}: {str(e)}")
+            # Сбрасываем состояние при ошибке подключения
+            self.connected = False
+            self.connection_ok = False
+            self.update_status_indicator()
             messagebox.showerror("Ошибка", f"Не удалось подключиться к {port_name}:\n{str(e)}")
 
-    def disconnect_port(self):
-        self.polling_active = False
+    def update_status_indicator(self):
+        """Обновление индикатора статуса"""
+        if not self.connected:
+            color = "gray"
+            text = "Не подключено"
+        elif not self.connection_ok:
+            color = "red"
+            text = "Потеря связи"
+        elif self.polling_active:
+            color = "blue"
+            text = "Опрос активен"
+        else:
+            color = "green"
+            text = "Связь OK"
+        
+        self.status_label.config(text=f"Статус: {text}")
+
+    def safe_disconnect(self):
+        """Безопасное отключение с полной очисткой состояния"""
+        self.log_message("🔌 Безопасное отключение...")
         self.connected = False
-        self.running = False
+        self.connection_ok = False
+        self.polling_active = False
         
-        # Сбрасываем RTS при отключении
-        if self.serial_port and hasattr(self.serial_port, 'is_open'):
-            try:
-                self.serial_port.rts = False
-                # Читаем конечное состояние для логирования
-                final_state = self.serial_port.rts
-                self.log_message(f"🔍 Конечное состояние RTS при отключении: {final_state}")
-            except:
-                pass
-        
-        time.sleep(0.1)
+        # Даем время потоку чтения завершиться
+        if self.read_thread and self.read_thread.is_alive():
+            time.sleep(0.1)
         
         try:
             if self.serial_port and hasattr(self.serial_port, 'is_open'):
-                self.serial_port.reset_input_buffer()
-                self.serial_port.reset_output_buffer()
                 self.serial_port.close()
-                self.log_message("COM порт закрыт")
+                self.log_message("📴 Порт закрыт")
         except Exception as e:
             self.log_message(f"Ошибка при закрытии порта: {str(e)}")
         
-        self.status_label.config(text="Статус: Не подключено")
-        self.alive_status.config(text="[ALIVE: ---]", fg="gray")
+        # Сбрасываем состояние парсера
+        self.parser_state = "WAIT_HEADER"
+        self.rx_buffer = bytearray()
+        self.header_index = 0
+        
+        # Восстанавливаем UI в главном потоке
+        self.root.after(0, self.reset_connection_ui)
+
+    def reset_connection_ui(self):
+        """Сброс UI для повторного подключения"""
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
-        self.set_mode_btn.config(state=tk.DISABLED)
-        self.get_mode_btn.config(state=tk.DISABLED)
-        self.rts_btn.config(state=tk.DISABLED, text="RTS: OFF", bg="light gray")  # Всегда OFF при отключении
+        self.get_sensors_btn.config(state=tk.DISABLED)
+        self.start_poll_btn.config(state=tk.DISABLED)
+        self.stop_poll_btn.config(state=tk.DISABLED)
         self.port_combobox.config(state='readonly')
-        self.mode_status_label.config(text="Текущий: ---", fg="blue")
+        self.baud_combobox.config(state='readonly')
         
-        # Сбрасываем combobox к значению по умолчанию
-        self.mode_combobox.set("NORMAL_0")
-
+        self.status_label.config(text="Статус: Не подключено")
+        self.alive_status.config(text="[ALIVE: ---]", fg="gray")
+        
         self.sensor_data = {}
+        self.sensor_info = {}
         self.sensors_count = 0
-        self.current_sensor_index = 0
         
+        # Удаляем вкладки датчиков
         for tab in self.notebook.tabs()[1:]:
             self.notebook.forget(tab)
 
+    def disconnect_port(self):
+        """Отключение от порта с полной очисткой состояния"""
+        self.safe_disconnect()
+
     def log_message(self, message):
+        """Добавление сообщения в лог"""
         self.system_text.config(state=tk.NORMAL)
         
         line_count = int(self.system_text.index('end-1c').split('.')[0])
@@ -883,356 +1058,60 @@ class SensorApp:
         self.system_text.insert(tk.END, message + "\n")
         self.system_text.see(tk.END)
         self.system_text.config(state=tk.DISABLED)
-    
-    def send_packet(self, payload):
-        """Отправка пакета с CRC8"""
-        if not self.serial_port or not self.serial_port.is_open:
-            return False
+
+    def check_alive_status(self):
+        """Проверка статуса связи"""
+        if self.connected and self.serial_port and self.serial_port.is_open:
+            current_time = time.time() * 1000
+            time_diff = current_time - self.last_alive_time
             
+            if time_diff > self.alive_timeout:
+                self.alive_status.config(text="[ALIVE: NO RESPONSE]", fg="red")
+                self.log_message("⚠️ Устройство не отвечает (Alive timeout)")
+            else:
+                self.alive_status.config(text="[ALIVE: OK]", fg="green")
+        
+        self.root.after(self.alive_check_interval, self.check_alive_status)
+
+    def show_context_menu(self, event):
+        """Показать контекстное меню"""
         try:
-            packet = self.build_packet(payload)
-            self.serial_port.write(packet)
-            self.serial_port.flush()
-            
-            # Логируем отправленный пакет
-            self.log_message(f"📤 Отправлен пакет: {packet.hex(' ')}")
-            self.log_message(f"   Payload: {payload.hex(' ')}")
-            self.log_message(f"   CRC: {packet[-1]:02X}")
-            
-            return True
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+
+    def copy_from_log(self):
+        """Копирование из лога"""
+        try:
+            if self.system_text.tag_ranges(tk.SEL):
+                selected_text = self.system_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+                self.root.clipboard_clear()
+                self.root.clipboard_append(selected_text)
         except Exception as e:
-            self.log_message(f"❌ Ошибка отправки пакета: {str(e)}")
-            return False
-    
-    def request_sensor_count(self):
-        """Запрос количества датчиков (0x0002)"""
-        payload = bytes([0x02, 0x00])  # Command code 0x0002
-        if self.send_packet(payload):
-            self.log_message("📊 Запрос количества датчиков")
-    
-    def request_sensor_data(self, sensor_index):
-        """Запрос данных датчика (0x0003)"""
-        payload = bytes([
-            0x03, 0x00,  # Command code 0x0003
-            (sensor_index & 0xFF), 
-            ((sensor_index >> 8) & 0xFF)
-        ])
-        if self.send_packet(payload):
-            self.log_message(f"📡 Запрос данных датчика {sensor_index} отправлен")
-    
-    def read_serial_data(self):
-        while self.running:
-            try:
-                if not self.serial_port or not hasattr(self.serial_port, 'is_open') or not self.serial_port.is_open:
-                    time.sleep(1)
-                    continue
-                    
-                try:
-                    if self.serial_port.in_waiting > 0:
-                        data = self.serial_port.read(self.serial_port.in_waiting)
-                        self.process_received_data(data)
-                except (serial.SerialException, OSError) as e:
-                    if self.running:
-                        self.log_message(f"Ошибка чтения порта: {str(e)}")
-                    time.sleep(1)
-                    
-            except Exception as e:
-                if self.running:
-                    self.log_message(f"Ошибка в потоке чтения: {str(e)}")
-                time.sleep(1)
-                
-            time.sleep(0.1)
-    
-    def process_received_data(self, data):
-        """Обработка принятых данных с использованием автомата состояний"""
-        for byte in data:
-            payload = self.process_received_byte(byte)
-            if payload is not None:
-                self.process_payload(payload)
-    
-    def process_payload(self, payload):
-        """Обработка распарсенного payload"""
-        self.log_message(f"📨 Получен payload: {payload.hex(' ')}")
-        self.last_alive_time = time.time() * 1000
-        
-        if len(payload) < 2:
-            self.log_message("⚠️ Слишком короткий payload")
-            return
-            
-        cmd_code = payload[0] | (payload[1] << 8)
-        
-        # Обработка ответа с количеством датчиков (0x0002)
-        if cmd_code == 0x0002 and len(payload) >= 3:
-            new_sensors_count = payload[2]
-            self.log_message(f"📊 Получено количество датчиков: {new_sensors_count}")
-            
-            # Обновляем количество датчиков только если оно изменилось
-            if new_sensors_count != self.sensors_count:
-                self.sensors_count = new_sensors_count
-                self.initialize_sensor_system()
-            else:
-                self.log_message("ℹ️ Количество датчиков не изменилось")
-            return
-            
-        # Обработка данных датчика (0x0003)
-        if cmd_code == 0x0003 and len(payload) >= 15:
-            try:
-                sensor_index = payload[2] | (payload[3] << 8)
-                sensor_type = payload[4]
-                
-                value = payload[5] | (payload[6] << 8)
-                gain = payload[7] | (payload[8] << 8)
-                offset = payload[9] | (payload[10] << 8)
-                is_valid = payload[11]
-                location = payload[12]
-                is_fault_detection = payload[13]
-                fault_level = payload[14] | (payload[15] << 8)
-                
-                self.sensor_data[sensor_index] = {
-                    'type': sensor_type,
-                    'value': value,
-                    'gain': gain,
-                    'offset': offset,
-                    'is_valid': is_valid,
-                    'location': location,
-                    'is_fault_detection': is_fault_detection,
-                    'fault_level': fault_level
-                }
-                
-                self.log_message(
-                    f"📡 Данные датчика {sensor_index}:\n"
-                    f"   Тип: {self.get_sensor_type_name(sensor_type)}\n"
-                    f"   Значение: {value}\n"
-                    f"   Усиление: {gain}\n"
-                    f"   Смещение: {offset}\n"
-                    f"   Статус: {'VALID' if is_valid else 'INVALID'}\n"
-                    f"   Расположение: {location}\n"
-                    f"   Детекция ошибок: {'ON' if is_fault_detection else 'OFF'}\n"
-                    f"   Уровень ошибки: {fault_level}"
-                )
-                
-                self.root.after(0, lambda idx=sensor_index: self.update_sensor_display(idx))
-                
-            except IndexError as e:
-                self.log_message(f"❌ Ошибка обработки данных датчика: {str(e)}")
-            return
-            
-        # Обработка Alive-сообщения (0x0001)
-        if cmd_code == 0x0001:
-            self.log_message("💓 Получен Alive ответ от устройства")
-            return
-            
-        # Обработка ответа на SET_MODE (0x0064)
-        if cmd_code == 0x0064 and len(payload) >= 4:
-            mode_value = payload[2] | (payload[3] << 8)
-            mode_name = self.device_modes.get(mode_value, f"UNKNOWN ({mode_value})")
-            
-            self.current_mode = mode_value
-            self.mode_status_label.config(text=f"Текущий: {mode_name}", fg="green")
-            self.update_mode_combobox(mode_value)
-            self.log_message(f"✅ Подтверждение установки режима: {mode_name}")
-            return
-            
-        # Обработка ответа на GET_MODE (0x0004)
-        if cmd_code == 0x0004 and len(payload) >= 4:
-            mode_value = payload[2] | (payload[3] << 8)
-            mode_name = self.device_modes.get(mode_value, f"UNKNOWN ({mode_value})")
-            
-            self.current_mode = mode_value
-            self.mode_status_label.config(text=f"Текущий: {mode_name}", fg="blue")
-            self.update_mode_combobox(mode_value)
-            self.log_message(f"📊 Получен текущий режим: {mode_name}")
-            
-            # Логируем для отладки синхронизации
-            if hasattr(self, 'expected_mode'):
-                if mode_value == self.expected_mode:
-                    self.log_message("🎯 Режим совпадает с ожидаемым!")
-                else:
-                    self.log_message(f"⚠️ Режим не совпадает: ожидали {self.expected_mode}, получили {mode_value}")
-            return
-            
-        # Обработка NACK ответа (0x0000)
-        if cmd_code == 0x0000 and len(payload) >= 4:
-            nack_code = payload[2] | (payload[3] << 8)
-            nack_messages = {
-                1: "Неверная команда",
-                2: "Устройство занято", 
-                3: "Неверный параметр"
-            }
-            error_msg = nack_messages.get(nack_code, f"Неизвестная ошибка (код: {nack_code})")
-            self.log_message(f"❌ Ошибка от устройства: {error_msg}")
-            
-            # ОСОБАЯ ОБРАБОТКА ДЛЯ SET_MODE
-            if hasattr(self, 'expected_mode') and self.expected_mode is not None:
-                self.log_message("❌ Смена режима отклонена устройством!")
-                self.received_nack = True  # Устанавливаем флаг получения NACK
-            else:
-                # Для других команд показываем сообщение сразу
-                messagebox.showerror("Ошибка устройства", error_msg)
-            return
-            
-        self.log_message(f"⚠️ Неизвестная команда: 0x{cmd_code:04X}")
+            self.log_message(f"Ошибка копирования: {str(e)}")
 
-    def initialize_sensor_system(self):
-        self.create_sensor_tabs()
-        self.polling_active = True
-        self.start_sensor_polling()
+    def clear_log(self):
+        """Очистка лога"""
+        self.system_text.config(state=tk.NORMAL)
+        self.system_text.delete(1.0, tk.END)
+        self.system_text.config(state=tk.DISABLED)
 
-    def start_sensor_polling(self):
-        """Запуск опроса датчиков после успешной смены режима"""
-        if self.sensors_count > 0:
-            self.log_message(f"🚀 Запуск опроса {self.sensors_count} датчиков")
-            self.polling_active = True
-            self.current_sensor_index = 0  # СБРОС ИНДЕКСА
-            self.poll_next_sensor()
+    def update_ports_list(self):
+        """Обновление списка портов"""
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        self.port_combobox['values'] = ports
+        if ports:
+            self.port_combobox.set(ports[0])
         else:
-            self.log_message("⚠️ Количество датчиков = 0, опрос не запущен")
-            # Но все равно устанавливаем флаг для будущих запросов
-            self.polling_active = True
+            self.port_combobox.set('')
+            self.status_label.config(text="Статус: COM-порты не найдены")
 
-    def poll_next_sensor(self):
-        if not self.polling_active or not self.connected or not self.serial_port.is_open:
-            return
-            
-        if self.sensors_count > 0:
-            self.request_sensor_data(self.current_sensor_index)
-            self.current_sensor_index = (self.current_sensor_index + 1) % self.sensors_count
-            self.root.after(self.polling_interval, self.poll_next_sensor)
-
-    def create_sensor_tabs(self):
-        if not hasattr(self, 'notebook'):
-            return
-            
-        for tab in self.notebook.tabs()[1:]:
-            self.notebook.forget(tab)
-        
-        self.sensor_widgets = {}
-        
-        for i in range(self.sensors_count):
-            tab = ttk.Frame(self.notebook)
-            self.notebook.add(tab, text=f"Датчик {i}")
-            
-            ttk.Label(tab, text=f"Данные датчика {i}", 
-                    font=('Arial', 12, 'bold')).pack(pady=5)
-            
-            self.create_sensor_display(tab, i)
-
-    def get_sensor_type_name(self, type_code):
-        sensor_types = {
-            0: "UNDEFINED",
-            1: "TEMPERATURE",
-            2: "PRESSURE",
-            3: "HUMIDITY",
-            4: "DUST",
-            5: "COUNT"
-        }
-        return sensor_types.get(type_code, f"UNKNOWN ({type_code})")
-
-    def get_sensor_units(self, type_code):
-        units = {
-            0: "",
-            1: "°C",
-            2: "kPa",
-            3: "%",
-            4: "μg/m³",
-            5: ""
-        }
-        return units.get(type_code, "")
-
-    def get_location_name(self, location_code):
-        locations = {
-            0: "SENSOR_LOCATION_UNDEF",
-            1: "SENSOR_LOCATION_1",
-            2: "SENSOR_LOCATION_2",
-            3: "SENSOR_LOCATION_3",
-            4: "SENSOR_LOCATION_4",
-            5: "SENSOR_LOCATION_5",
-            6: "SENSOR_LOCATION_6",
-            7: "SENSOR_LOCATION_7",
-            8: "SENSOR_LOCATION_COUNT"
-        }
-        return locations.get(location_code, f"UNKNOWN_LOCATION ({location_code})")
-
-    def calculate_processed_value(self, data):
-        try:
-            if data['gain'] == 0:
-                return 0
-            return (data['value'] / data['gain']) - data['offset']
-        except:
-            return 0   
-   
-    def create_sensor_display(self, parent, sensor_index):
-        frame = tk.Frame(parent)
-        frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        sensor_widgets = {}
-        
-        labels_info = [
-            ("Тип:", 'type'),
-            ("Расположение:", 'location'),
-            ("Сырое значение:", 'value'),
-            ("Усиление:", 'gain'),
-            ("Смещение:", 'offset'),
-            ("Результат:", 'processed'),
-            ("Статус:", 'status'),
-            ("Детекция ошибок:", 'fault_detection'),
-            ("Уровень ошибки:", 'fault_level')
-        ]
-        
-        for row, (label_text, key) in enumerate(labels_info):
-            tk.Label(frame, text=label_text).grid(row=row, column=0, sticky=tk.W, pady=2)
-            sensor_widgets[key] = tk.Label(frame, text="---")
-            sensor_widgets[key].grid(row=row, column=1, sticky=tk.W)
-        
-        self.sensor_widgets[sensor_index] = sensor_widgets
-    
-    def update_sensor_display(self, sensor_index):
-        if sensor_index in self.sensor_widgets and sensor_index in self.sensor_data:
-            widgets = self.sensor_widgets[sensor_index]
-            data = self.sensor_data[sensor_index]
-            
-            sensor_type = data['type']
-            unit = self.get_sensor_units(sensor_type)
-            processed_value = self.calculate_processed_value(data)
-            
-            if data['fault_level'] == 0xFFFF:
-                fault_level_text = "---"
-            else:
-                processed_fault_level = self.calculate_processed_value({
-                    'value': data['fault_level'],
-                    'gain': data['gain'],
-                    'offset': data['offset']
-                })
-                fault_level_text = f"{processed_fault_level:.2f} {unit}"
-            
-            widgets['type'].config(text=f"{self.get_sensor_type_name(sensor_type)}")
-            widgets['location'].config(text=f"{self.get_location_name(data['location'])}")
-            widgets['value'].config(text=f"{data['value']} (raw)")
-            widgets['gain'].config(text=f"{data['gain']}")
-            widgets['offset'].config(text=f"{data['offset']}")
-            widgets['processed'].config(text=f"{processed_value:.2f} {unit}")
-            widgets['status'].config(
-                text="VALID" if data['is_valid'] else "INVALID",
-                fg="green" if data['is_valid'] else "red"
-            )
-            widgets['fault_detection'].config(
-                text="ON" if data['is_fault_detection'] else "OFF",
-                fg="green" if data['is_fault_detection'] else "red"
-            )
-            widgets['fault_level'].config(text=fault_level_text)
-    
-    def request_initial_config(self):
-        """Запрос начальной конфигурации при подключении"""
-        self.log_message("📋 Запрос начальной конфигурации устройства...")
-        self.request_device_mode()
-        self.root.after(500, self.request_sensor_count)
-    
     def on_closing(self):
+        """Обработчик закрытия приложения"""
         self.polling_active = False
         self.running = False
         if self.serial_port and self.serial_port.is_open:
             try:
-                self.serial_port.rts = False  # Сбрасываем RTS при закрытии
                 self.serial_port.close()
             except:
                 pass
