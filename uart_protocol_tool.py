@@ -102,13 +102,16 @@ class SimpleUARTApp:
         }
         
         # Protocol settings from uart_transport_parser.c
-        self.PROTOCOL_SYNC_BYTES = [0x41, 0x41]  # 'A', 'A'
+        # ГИБКАЯ НАСТРОЙКА ЗАГОЛОВКА - можно легко изменить длину и байты
+        self.HEADER_SEQUENCE = [0x1F, 0x8B, 0xE2, 0x74]  # Теперь легко изменить на [0x55, 0xAA, 0xBB, 0xCC]
+        self.HEADER_LENGTH = len(self.HEADER_SEQUENCE)
         self.MAX_PAYLOAD_SIZE = 64
         
-        # Parser state
+        # Parser state - упрощенный автомат состояний
         self.rx_buffer = bytearray()
-        self.parser_state = "WAIT_SYNC"
+        self.parser_state = "WAIT_HEADER"
         self.expected_length = 0
+        self.header_index = 0  # Индекс текущего байта заголовка
         
         # Status variables
         self.connection_ok = False
@@ -141,13 +144,13 @@ class SimpleUARTApp:
             raise ValueError(f"Payload too large: {len(payload)} bytes")
         
         packet = bytearray()
-        packet.extend([0x41, 0x41])  # Sync bytes
+        packet.extend(self.HEADER_SEQUENCE)  # Sync bytes
         packet.append(len(payload))  # Length
         
         # Add payload
         packet.extend(payload)
         
-        # Calculate CRC (only length + payload, without sync bytes)
+        # Calculate CRC (only length + payload, without header bytes)
         crc_data = bytearray()
         crc_data.append(len(payload))  # Length
         crc_data.extend(payload)       # Payload
@@ -159,26 +162,29 @@ class SimpleUARTApp:
 
     def parse_packet(self, packet_data):
         """Разбор входящего пакета"""
-        if len(packet_data) < 4:
+        min_packet_length = self.HEADER_LENGTH + 2  # header + length + crc
+        if len(packet_data) < min_packet_length:
             return None, "Packet too short"
         
-        # Check sync bytes
-        if packet_data[0] != 0x41 or packet_data[1] != 0x41:
-            return None, "Invalid sync bytes"
+        # Check header bytes
+        for i in range(self.HEADER_LENGTH):
+            if packet_data[i] != self.HEADER_SEQUENCE[i]:
+                return None, f"Invalid header byte at position {i}: expected 0x{self.HEADER_SEQUENCE[i]:02X}, got 0x{packet_data[i]:02X}"
         
         # Get payload length
-        payload_length = packet_data[2]
+        payload_length = packet_data[self.HEADER_LENGTH]
         
         # Check total packet length
-        expected_packet_length = payload_length + 4
+        expected_packet_length = self.HEADER_LENGTH + payload_length + 2  # header + payload + length + crc
         if len(packet_data) != expected_packet_length:
             return None, f"Length mismatch: expected {expected_packet_length}, got {len(packet_data)}"
         
         # Verify CRC
         received_crc = packet_data[-1]
         crc_data = bytearray()
-        crc_data.append(payload_length)
-        crc_data.extend(packet_data[3:3 + payload_length])
+        crc_data.append(payload_length)  # Length byte
+        payload_start = self.HEADER_LENGTH + 1
+        crc_data.extend(packet_data[payload_start:payload_start + payload_length])  # Payload
         
         calculated_crc = self.crc8_calculate(crc_data)
         
@@ -186,37 +192,45 @@ class SimpleUARTApp:
             return None, f"CRC error: received 0x{received_crc:02X}, calculated 0x{calculated_crc:02X}"
         
         # Extract payload
-        payload = packet_data[3:3 + payload_length]
+        payload = packet_data[payload_start:payload_start + payload_length]
         return payload, None
 
     def process_received_byte(self, byte):
-        """Обработка входящего байта (автомат состояний)"""
-        if self.parser_state == "WAIT_SYNC":
-            if byte == 0x41:
-                self.rx_buffer = bytearray([byte])
-                self.parser_state = "WAIT_SYNC2"
-            return None
-            
-        elif self.parser_state == "WAIT_SYNC2":
-            if byte == 0x41:
+        """Обработка входящего байта (упрощенный автомат состояний)"""
+        if self.parser_state == "WAIT_HEADER":
+            if byte == self.HEADER_SEQUENCE[self.header_index]:
                 self.rx_buffer.append(byte)
-                self.parser_state = "WAIT_LENGTH"
+                self.header_index += 1
+                
+                if self.header_index >= self.HEADER_LENGTH:
+                    # Весь заголовок получен
+                    self.parser_state = "WAIT_LENGTH"
+                    self.header_index = 0  # Сброс для следующего пакета
             else:
-                self.parser_state = "WAIT_SYNC"
+                # Неверный байт заголовка - начинаем сначала
+                self.header_index = 0
+                self.rx_buffer = bytearray()
+                
+                # Проверяем, может быть это начало новой последовательности?
+                if byte == self.HEADER_SEQUENCE[0]:
+                    self.rx_buffer.append(byte)
+                    self.header_index = 1
             return None
             
         elif self.parser_state == "WAIT_LENGTH":
             self.rx_buffer.append(byte)
             payload_length = byte
-            self.expected_length = payload_length + 4
+            self.expected_length = self.HEADER_LENGTH + payload_length + 2  # header + payload + length + crc
             
             if payload_length > self.MAX_PAYLOAD_SIZE:
-                self.parser_state = "WAIT_SYNC"
+                # Слишком длинный пакет - сброс
+                self.parser_state = "WAIT_HEADER"
                 self.rx_buffer = bytearray()
                 return None
             elif payload_length > 0:
                 self.parser_state = "WAIT_DATA"
             else:
+                # Пакет нулевой длины - ждем CRC
                 self.parser_state = "WAIT_CRC"
             return None
             
@@ -229,7 +243,9 @@ class SimpleUARTApp:
         elif self.parser_state == "WAIT_CRC":
             self.rx_buffer.append(byte)
             packet_data = bytes(self.rx_buffer)
-            self.parser_state = "WAIT_SYNC"
+            
+            # Сбрасываем состояние перед обработкой
+            self.parser_state = "WAIT_HEADER"
             self.rx_buffer = bytearray()
             
             payload, error = self.parse_packet(packet_data)
@@ -270,6 +286,27 @@ class SimpleUARTApp:
         
         self.refresh_btn = ttk.Button(conn_frame, text="Обновить", command=self.update_ports_list)
         self.refresh_btn.grid(row=0, column=6, padx=5)
+        
+        # Protocol settings frame
+        protocol_frame = ttk.LabelFrame(main_frame, text="Настройки протокола", padding="5")
+        protocol_frame.pack(fill=tk.X, pady=5)
+        
+        # Current header display
+        ttk.Label(protocol_frame, text="Текущий заголовок:").grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.current_header_label = ttk.Label(protocol_frame, text=self.get_header_display(), 
+                                            foreground="blue", font=("Arial", 9, "bold"))
+        self.current_header_label.grid(row=0, column=1, padx=5, sticky=tk.W)
+        
+        # Header configuration
+        ttk.Label(protocol_frame, text="Новый заголовок:").grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.header_entry = ttk.Entry(protocol_frame, width=20)
+        self.header_entry.insert(0, " ".join([f"{b:02X}" for b in self.HEADER_SEQUENCE]))
+        self.header_entry.grid(row=1, column=1, padx=5)
+        
+        ttk.Button(protocol_frame, text="Применить", command=self.update_header).grid(row=1, column=2, padx=5)
+        
+        ttk.Label(protocol_frame, text="Формат: hex байты через пробел", 
+                 foreground="gray", font=("Arial", 8)).grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=5)
         
         # Status indicator frame
         status_frame = ttk.LabelFrame(main_frame, text="Статус связи", padding="5")
@@ -350,6 +387,59 @@ class SimpleUARTApp:
         self.filter_checkbox = ttk.Checkbutton(log_controls, text="Скрывать Alive сообщения", 
                                              variable=self.filter_alive_var)
         self.filter_checkbox.pack(side=tk.RIGHT, padx=5)
+
+    def get_header_display(self):
+        """Получить строку для отображения текущего заголовка"""
+        return " ".join([f"0x{b:02X}" for b in self.HEADER_SEQUENCE])
+
+    def update_header_display(self):
+        """Обновить отображение текущего заголовка"""
+        self.current_header_label.config(text=self.get_header_display())
+
+    def update_header(self):
+        """Обновление последовательности заголовка"""
+        try:
+            header_text = self.header_entry.get().strip()
+            if not header_text:
+                self.log_message("❌ Не указана последовательность заголовка")
+                return
+                
+            # Парсим hex байты
+            hex_bytes = header_text.split()
+            new_header = []
+            
+            for hex_byte in hex_bytes:
+                hex_byte_clean = hex_byte.lower().replace('0x', '')
+                byte_value = int(hex_byte_clean, 16)
+                
+                if byte_value < 0 or byte_value > 255:
+                    raise ValueError(f"Hex value out of range: {hex_byte}")
+                
+                new_header.append(byte_value)
+            
+            if not new_header:
+                self.log_message("❌ Пустая последовательность заголовка")
+                return
+                
+            # Обновляем настройки
+            self.HEADER_SEQUENCE = new_header
+            self.HEADER_LENGTH = len(new_header)
+            
+            # Сбрасываем парсер
+            self.parser_state = "WAIT_HEADER"
+            self.rx_buffer = bytearray()
+            self.header_index = 0
+            
+            # Обновляем отображение
+            self.update_header_display()
+            
+            self.log_message(f"✅ Заголовок обновлен: {[f'0x{b:02X}' for b in self.HEADER_SEQUENCE]}")
+            self.log_message(f"   Длина заголовка: {self.HEADER_LENGTH} байт")
+            
+        except ValueError as e:
+            self.log_message(f"❌ Ошибка в формате заголовка: {str(e)}")
+        except Exception as e:
+            self.log_message(f"❌ Ошибка обновления заголовка: {str(e)}")
 
     def show_log_context_menu(self, event):
         """Показать контекстное меню для лога"""
@@ -570,8 +660,9 @@ class SimpleUARTApp:
             self.log_message(f"Ошибка при закрытии порта: {str(e)}")
         
         # Сбрасываем состояние парсера
-        self.parser_state = "WAIT_SYNC"
+        self.parser_state = "WAIT_HEADER"
         self.rx_buffer = bytearray()
+        self.header_index = 0
         
         # Восстанавливаем UI в главном потоке
         self.root.after(0, self.reset_connection_ui)
@@ -732,8 +823,9 @@ class SimpleUARTApp:
             self.log_message(f"✅ Подключено к {port_name} ({baud_rate} бод)")
             
             # Сбрасываем состояние парсера
-            self.parser_state = "WAIT_SYNC"
+            self.parser_state = "WAIT_HEADER"
             self.rx_buffer = bytearray()
+            self.header_index = 0
             
             # Запускаем новый поток чтения
             self.read_thread = Thread(target=self.read_serial_data, daemon=True)
