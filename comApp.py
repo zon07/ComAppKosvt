@@ -11,9 +11,9 @@ class SensorApp:
         self.root.title("KOSTVT UART Monitor v2.0")
         
         # Фиксируем размер окна
-        self.root.geometry("800x600")
-        self.root.minsize(800, 600)
-        self.root.maxsize(800, 600)
+        self.root.geometry("700x550")
+        self.root.minsize(700, 550)
+        self.root.maxsize(700, 550)
         
         # Serial communication
         self.serial_port = None
@@ -59,6 +59,16 @@ class SensorApp:
             6: "SENSOR_LOCATION_6",
             7: "SENSOR_LOCATION_7",
             8: "SENSOR_LOCATION_COUNT"
+        }
+        
+        # Units for display
+        self.units = {
+            0: "",
+            1: "°C",
+            2: "kPa",
+            3: "%",
+            4: "μg/m³",
+            5: ""
         }
         
         # Sensor polling
@@ -276,22 +286,42 @@ class SensorApp:
         if self.send_packet(payload):
             self.log_message("⚡ Запрос информации об уставках")
 
-    def send_fault_value(self, sensor_index, fault_value, is_fault_on):
+    def send_fault_value(self, sensor_index, fault_value_raw, is_fault_on):
         """Отправка уставки для датчика"""
         # Формируем параметры: [флаг_включения, MSB_значения, LSB_значения]
         parameter = bytearray([
             int(is_fault_on),  # Флаг включения (0/1)
-            (fault_value >> 8) & 0xFF,  # MSB значения
-            fault_value & 0xFF          # LSB значения
+            (fault_value_raw >> 8) & 0xFF,  # MSB значения
+            fault_value_raw & 0xFF          # LSB значения
         ])
         
         # Команда SET_FAULT_VALUE для конкретного датчика
+        # Используем базовую команду + индекс датчика в младших битах
         command_code = self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"] + sensor_index
-        command_name = f"UART_CMD_SET_FAULT_VALUE_{sensor_index}"
         
-        payload = self.build_command_payload("UART_CMD_SET_FAULT_VALUE", parameter)
-        if self.send_packet(payload):
-            self.log_message(f"⚡ Отправка уставки для датчика {sensor_index}: значение={fault_value}, включено={is_fault_on}")
+        # Big-endian command code (MSB first, LSB second)
+        payload = bytearray([
+            (command_code >> 8) & 0xFF,    # MSB команды
+            command_code & 0xFF,           # LSB команды
+        ])
+        
+        # Добавляем параметры
+        payload.extend(parameter)
+        
+        if self.send_packet(bytes(payload)):
+            self.log_message(f"⚡ Отправка уставки для датчика {sensor_index}: RAW={fault_value_raw}, включено={is_fault_on}")
+
+    def process_set_fault_response(self, payload, cmd_code):
+        """Обработка ответа на установку уставки"""
+        # Вычисляем индекс датчика из команды
+        sensor_index = cmd_code - self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"]
+        
+        if len(payload) >= 3 and payload[2] == 1:  # Статус успеха
+            self.log_message(f"✅ Уставка для датчика {sensor_index} успешно установлена")
+            # После успешной установки запрашиваем обновленную информацию об уставках
+            self.root.after(100, self.request_faults_info)
+        else:
+            self.log_message(f"❌ Ошибка установки уставки для датчика {sensor_index}")
 
     def process_received_packet(self, payload):
         """Обработка принятого пакета"""
@@ -337,8 +367,10 @@ class SensorApp:
             return
             
         # Обработка SET_FAULT_VALUE ответа
-        if cmd_code >= self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"] and \
-           cmd_code < (self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"] + self.sensors_count):
+        # Проверяем диапазон команд SET_FAULT_VALUE для всех датчиков
+        base_set_fault_cmd = self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"]
+        if cmd_code >= base_set_fault_cmd and \
+        cmd_code < (base_set_fault_cmd + self.sensors_count):
             self.process_set_fault_response(payload, cmd_code)
             return
             
@@ -467,6 +499,7 @@ class SensorApp:
                 if i not in self.sensor_data:
                     self.sensor_data[i] = {}
                 
+                # Обновляем только данные уставки, не перезаписываем состояние чекбокса
                 self.sensor_data[i]['is_fault_detection'] = bool(is_fault_detection)
                 self.sensor_data[i]['fault_level'] = fault_level
                 
@@ -481,137 +514,6 @@ class SensorApp:
         
         # Автоматически запускаем опрос после получения всей информации
         self.root.after(500, self.start_sensor_polling)
-
-    def update_sensor_displays(self):
-        """Обновление отображения всех датчиков"""
-        for sensor_index in range(self.sensors_count):
-            self.update_sensor_display(sensor_index)
-
-    def update_sensor_display(self, sensor_index):
-        """Обновление отображения конкретного датчика"""
-        if sensor_index in self.sensor_widgets and sensor_index in self.sensor_data:
-            widgets = self.sensor_widgets[sensor_index]
-            data = self.sensor_data[sensor_index]
-            
-            # Basic info
-            sensor_type = data.get('type', 0)
-            location = data.get('location', 0)
-            value = data.get('value', 0)
-            gain = data.get('gain', 1)
-            offset = data.get('offset', 0)
-            is_valid = data.get('is_valid', False)
-            is_fault_detection = data.get('is_fault_detection', False)
-            fault_level = data.get('fault_level', 0)
-            
-            # Units for display
-            units = {
-                1: "°C",  # TEMPERATURE
-                2: "kPa", # PRESSURE  
-                3: "%",   # HUMIDITY
-                4: "μg/m³" # DUST
-            }
-            unit = units.get(sensor_type, "")
-            
-            # Calculate processed value
-            if gain != 0:
-                processed_value = (value / gain) - offset
-            else:
-                processed_value = 0
-            
-            # Update widgets
-            widgets['type'].config(text=self.sensor_types.get(sensor_type, "UNKNOWN"))
-            widgets['location'].config(text=self.sensor_locations.get(location, "UNKNOWN"))
-            widgets['value'].config(text=f"{value} (raw)")
-            widgets['gain'].config(text=f"{gain}")
-            widgets['offset'].config(text=f"{offset}")
-            widgets['processed'].config(text=f"{processed_value:.2f} {unit}")
-            widgets['status'].config(
-                text="VALID" if is_valid else "INVALID",
-                fg="green" if is_valid else "red"
-            )
-            widgets['fault_detection'].config(
-                text="ON" if is_fault_detection else "OFF",
-                fg="green" if is_fault_detection else "red"
-            )
-            
-            # Update fault level with processed value if possible
-            if gain != 0:
-                processed_fault = (fault_level / gain) - offset
-                widgets['fault_level'].config(text=f"{processed_fault:.2f} {unit}")
-            else:
-                widgets['fault_level'].config(text=f"{fault_level} (raw)")
-            
-            # Update fault control
-            if 'fault_detection_var' in widgets:
-                widgets['fault_detection_var'].set(is_fault_detection)
-                widgets['fault_entry'].delete(0, tk.END)
-                widgets['fault_entry'].insert(0, str(fault_level))
-
-    def start_sensor_polling(self):
-        """Запуск опроса датчиков"""
-        if not self.connected:
-            return
-            
-        self.polling_active = True
-        self.start_poll_btn.config(state=tk.DISABLED)
-        self.stop_poll_btn.config(state=tk.NORMAL)
-        self.log_message("🔁 Запуск опроса датчиков")
-        self.poll_sensors()
-
-    def poll_sensors(self):
-        """Опрос датчиков"""
-        if not self.polling_active or not self.connected:
-            return
-            
-        self.request_sensors_value()
-        self.root.after(self.polling_interval, self.poll_sensors)
-
-    def process_sensors_value(self, payload):
-        """Обработка значений датчиков"""
-        if len(payload) < 3:
-            self.log_message("⚠️ Неверный формат значений датчиков")
-            return
-            
-        # Пропускаем 2 байта команды
-        data = payload[2:]
-        sensor_count = len(data) // 2  # 2 байта на значение
-        
-        self.log_message(f"📡 Получены значения {sensor_count} датчиков")
-        
-        for i in range(sensor_count):
-            start_idx = i * 2
-            if start_idx + 1 < len(data):
-                value = (data[start_idx] << 8) | data[start_idx + 1]
-                
-                # Маркер невалидных данных
-                if value == 0xFFFF:
-                    self.log_message(f"   Датчик {i}: НЕВАЛИДНЫЕ ДАННЫЕ")
-                    if i in self.sensor_data:
-                        self.sensor_data[i]['is_valid'] = False
-                else:
-                    if i not in self.sensor_data:
-                        self.sensor_data[i] = {}
-                    
-                    self.sensor_data[i]['value'] = value
-                    self.sensor_data[i]['is_valid'] = True
-                    
-                    # Добавляем информацию из sensor_info если есть
-                    if i in self.sensor_info:
-                        self.sensor_data[i].update(self.sensor_info[i])
-                    
-                    self.log_message(f"   Датчик {i}: значение={value}")
-        
-        # Обновляем отображение
-        self.root.after(0, self.update_sensor_displays)
-
-    def process_set_fault_response(self, payload, cmd_code):
-        """Обработка ответа на установку уставки"""
-        sensor_index = cmd_code - self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"]
-        
-        if len(payload) >= 3 and payload[2] == 1:  # Статус успеха
-            self.log_message(f"✅ Уставка для датчика {sensor_index} успешно установлена")
-        else:
-            self.log_message(f"❌ Ошибка установки уставки для датчика {sensor_index}")
 
     def create_widgets(self):
         main_frame = tk.Frame(self.root)
@@ -751,14 +653,23 @@ class SensorApp:
         sensor_widgets['fault_entry'] = tk.Entry(fault_frame, width=10)
         sensor_widgets['fault_entry'].grid(row=0, column=1, padx=5, pady=2)
         
+        # Добавляем единицы измерения для уставки
+        sensor_widgets['fault_unit_label'] = tk.Label(fault_frame, text="")
+        sensor_widgets['fault_unit_label'].grid(row=0, column=2, padx=2, pady=2)
+        
         sensor_widgets['fault_detection_var'] = tk.BooleanVar()
         sensor_widgets['fault_checkbox'] = tk.Checkbutton(fault_frame, text="Включить детектирование",
                                                         variable=sensor_widgets['fault_detection_var'])
-        sensor_widgets['fault_checkbox'].grid(row=0, column=2, padx=10, pady=2)
+        sensor_widgets['fault_checkbox'].grid(row=0, column=3, padx=10, pady=2)
         
         sensor_widgets['fault_button'] = tk.Button(fault_frame, text="Установить уставку",
                                                  command=lambda idx=sensor_index: self.send_fault_setting(idx))
-        sensor_widgets['fault_button'].grid(row=0, column=3, padx=5, pady=2)
+        sensor_widgets['fault_button'].grid(row=0, column=4, padx=5, pady=2)
+        
+        # Добавляем отображение RAW значения уставки
+        tk.Label(fault_frame, text="RAW уставка:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        sensor_widgets['fault_raw_label'] = tk.Label(fault_frame, text="---")
+        sensor_widgets['fault_raw_label'].grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=5, pady=2)
         
         self.sensor_widgets[sensor_index] = sensor_widgets
 
@@ -770,13 +681,55 @@ class SensorApp:
         widgets = self.sensor_widgets[sensor_index]
         
         try:
-            fault_value = int(widgets['fault_entry'].get())
+            # Получаем физическое значение из поля ввода
+            fault_value_physical = float(widgets['fault_entry'].get())
             is_fault_on = widgets['fault_detection_var'].get()
             
-            self.send_fault_value(sensor_index, fault_value, is_fault_on)
+            # Конвертируем физическое значение в RAW
+            fault_value_raw = self.physical_to_raw(sensor_index, fault_value_physical)
+            
+            if fault_value_raw is not None:
+                self.send_fault_value(sensor_index, fault_value_raw, is_fault_on)
+            else:
+                messagebox.showerror("Ошибка", "Не удалось преобразовать значение в RAW")
             
         except ValueError:
             messagebox.showerror("Ошибка", "Введите корректное числовое значение уставки")
+
+    def physical_to_raw(self, sensor_index, physical_value):
+        """Конвертация физического значения в RAW"""
+        if sensor_index not in self.sensor_data:
+            return None
+            
+        data = self.sensor_data[sensor_index]
+        gain = data.get('gain', 1)
+        offset = data.get('offset', 0)
+        
+        # Формула: raw = (physical + offset) * gain
+        raw_value = int((physical_value + offset) * gain)
+        
+        # Проверяем диапазон (0-65535 для 16-битного значения)
+        if raw_value < 0:
+            raw_value = 0
+        elif raw_value > 0xFFFF:
+            raw_value = 0xFFFF
+            
+        return raw_value
+
+    def raw_to_physical(self, sensor_index, raw_value):
+        """Конвертация RAW значения в физическое"""
+        if sensor_index not in self.sensor_data:
+            return 0
+            
+        data = self.sensor_data[sensor_index]
+        gain = data.get('gain', 1)
+        offset = data.get('offset', 0)
+        
+        if gain == 0:
+            return 0
+            
+        # Формула: physical = (raw / gain) - offset
+        return (raw_value / gain) - offset
 
     def update_sensor_displays(self):
         """Обновление отображения всех датчиков"""
@@ -799,19 +752,28 @@ class SensorApp:
             is_fault_detection = data.get('is_fault_detection', False)
             fault_level = data.get('fault_level', 0)
             
+            # Получаем единицы измерения
+            unit = self.units.get(sensor_type, "")
+            
             # Calculate processed value
             if gain != 0 and is_valid:
                 processed_value = (value / gain) - offset
             else:
                 processed_value = 0
             
-            # Update widgets
+            # Calculate physical fault level
+            if gain != 0:
+                processed_fault = (fault_level / gain) - offset
+            else:
+                processed_fault = 0
+            
+            # Update widgets с единицами измерения
             widgets['type'].config(text=self.sensor_types.get(sensor_type, "UNKNOWN"))
             widgets['location'].config(text=self.sensor_locations.get(location, "UNKNOWN"))
-            widgets['value'].config(text=f"{value} (raw)")
+            widgets['value'].config(text=f"{value} (raw) / {processed_value:.2f} {unit}")
             widgets['gain'].config(text=f"{gain}")
             widgets['offset'].config(text=f"{offset}")
-            widgets['processed'].config(text=f"{processed_value:.2f}")
+            widgets['processed'].config(text=f"{processed_value:.2f} {unit}")
             widgets['status'].config(
                 text="VALID" if is_valid else "INVALID",
                 fg="green" if is_valid else "red"
@@ -820,21 +782,25 @@ class SensorApp:
                 text="ON" if is_fault_detection else "OFF",
                 fg="green" if is_fault_detection else "red"
             )
+            widgets['fault_level'].config(text=f"{fault_level} (raw) / {processed_fault:.2f} {unit}")
             
-            # Update fault level with processed value if possible
-            if gain != 0:
-                processed_fault = (fault_level / gain) - offset
-                widgets['fault_level'].config(text=f"{fault_level} (raw) / {processed_fault:.2f}")
-            else:
-                widgets['fault_level'].config(text=f"{fault_level} (raw)")
+            # Обновляем единицы измерения для поля ввода уставки
+            widgets['fault_unit_label'].config(text=unit)
             
-            # Update fault control
-            widgets['fault_detection_var'].set(is_fault_detection)
+            # Обновляем отображение RAW значения уставки
+            widgets['fault_raw_label'].config(text=f"{fault_level}")
+            
+            # НЕ обновляем состояние чекбокса автоматически из данных с датчика
+            # чтобы пользователь мог установить свое значение
 
     def initialize_sensor_system(self):
         """Инициализация системы датчиков"""
         self.log_message(f"🚀 Инициализация системы с {self.sensors_count} датчиками")
         self.create_sensor_tabs()
+        
+        # Включаем кнопки управления
+        self.start_poll_btn.config(state=tk.NORMAL)
+        self.stop_poll_btn.config(state=tk.NORMAL)
         
         # Запрашиваем дополнительную информацию
         self.request_sensors_info()
@@ -842,13 +808,25 @@ class SensorApp:
 
     def start_sensor_polling(self):
         """Запуск опроса датчиков"""
+        if not self.connected:
+            return
+            
         self.polling_active = True
+        self.start_poll_btn.config(state=tk.DISABLED)
+        self.stop_poll_btn.config(state=tk.NORMAL)
         self.log_message("🔁 Запуск опроса датчиков")
+        
+        # Инициализируем флаги
+        self._waiting_for_sensor_values = False
+        self._sensor_values_received_time = None
+        
         self.poll_sensors()
 
     def stop_sensor_polling(self):
         """Остановка опроса датчиков"""
         self.polling_active = False
+        self.start_poll_btn.config(state=tk.NORMAL)
+        self.stop_poll_btn.config(state=tk.DISABLED)
         self.log_message("⏹️ Остановка опроса датчиков")
 
     def poll_sensors(self):
@@ -856,16 +834,36 @@ class SensorApp:
         if not self.polling_active or not self.connected:
             return
             
+        # Запрашиваем значения датчиков
         self.request_sensors_value()
+        
+        # Устанавливаем флаг ожидания значений
+        self._waiting_for_sensor_values = True
+        self._sensor_values_received_time = None
+        
         self.root.after(self.polling_interval, self.poll_sensors)
+
+    def _request_faults_delayed(self):
+        """Отложенный запрос уставок"""
+        if self.polling_active and self.connected:
+            self.request_faults_info()
+        self._faults_pending = False
+
+    def process_set_fault_response(self, payload, cmd_code):
+        """Обработка ответа на установку уставки"""
+        sensor_index = cmd_code - self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"]
+        
+        if len(payload) >= 3 and payload[2] == 1:  # Статус успеха
+            self.log_message(f"✅ Уставка для датчика {sensor_index} успешно установлена")
+            # После успешной установки запрашиваем обновленную информацию об уставках
+            self.root.after(100, self.request_faults_info)
+        else:
+            self.log_message(f"❌ Ошибка установки уставки для датчика {sensor_index}")
 
     def request_initial_config(self):
         """Запрос начальной конфигурации"""
         self.log_message("📋 Запрос начальной конфигурации устройства...")
         self.request_sensor_count()
-
-    # Остальные методы (connect_to_port, disconnect_port, log_message, etc.) 
-    # остаются практически без изменений, нужно только обновить read_serial_data
 
     def read_serial_data(self):
         """Чтение данных из порта"""
