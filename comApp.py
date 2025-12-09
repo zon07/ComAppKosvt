@@ -36,6 +36,8 @@ class SensorApp:
             "UART_CMD_SET_FAULT_VALUE": 0x5000,
             "UART_CMD_NACK": 0xE000,
             "UART_CMD_ALIVE": 0xE001,
+            "UART_CMD_GET_SERIAL": 0xF500,          # Запрос серийного номера
+            "UART_CMD_SET_SERIAL": 0xF505,          # Запись серийного номера
         }
         
         # Sensor types
@@ -70,6 +72,9 @@ class SensorApp:
             4: "μg/m³",
             5: ""
         }
+        
+        # Serial number
+        self.serial_number = "0000000000000000"  # 16 символов по умолчанию
         
         # Sensor polling
         self.polling_interval = 500
@@ -286,6 +291,36 @@ class SensorApp:
         if self.send_packet(payload):
             self.log_message("⚡ Запрос информации об уставках")
 
+    def request_serial_number(self):
+        """Запрос серийного номера"""
+        payload = self.build_command_payload("UART_CMD_GET_SERIAL")
+        if self.send_packet(payload):
+            self.log_message("🔢 Запрос серийного номера")
+
+    def set_serial_number(self):
+        """Установка серийного номера"""
+        serial_str = self.serial_entry.get().strip()
+        
+        if len(serial_str) != 16:
+            messagebox.showerror("Ошибка", "Серийный номер должен быть длиной 16 символов")
+            return
+            
+        # Проверяем что все символы ASCII
+        try:
+            serial_bytes = serial_str.encode('ascii')
+        except UnicodeEncodeError:
+            messagebox.showerror("Ошибка", "Серийный номер должен содержать только ASCII символы")
+            return
+            
+        # Собираем payload: команда + 16 байт серийного номера
+        parameter = bytearray(serial_bytes)  # 16 байт серийного номера
+        
+        payload = self.build_command_payload("UART_CMD_SET_SERIAL", parameter)
+        if self.send_packet(payload):
+            self.log_message(f"🔢 Отправка серийного номера: {serial_str}")
+            # После отправки запрашиваем обновленный серийный номер
+            self.root.after(500, self.request_serial_number)
+
     def send_fault_value(self, sensor_index, fault_value_raw, is_fault_on):
         """Отправка уставки для датчика"""
         # Формируем параметры: [флаг_включения, MSB_значения, LSB_значения]
@@ -311,18 +346,6 @@ class SensorApp:
         if self.send_packet(bytes(payload)):
             self.log_message(f"⚡ Отправка уставки для датчика {sensor_index}: RAW={fault_value_raw}, включено={is_fault_on}")
 
-    def process_set_fault_response(self, payload, cmd_code):
-        """Обработка ответа на установку уставки"""
-        # Вычисляем индекс датчика из команды
-        sensor_index = cmd_code - self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"]
-        
-        if len(payload) >= 3 and payload[2] == 1:  # Статус успеха
-            self.log_message(f"✅ Уставка для датчика {sensor_index} успешно установлена")
-            # После успешной установки запрашиваем обновленную информацию об уставках
-            self.root.after(100, self.request_faults_info)
-        else:
-            self.log_message(f"❌ Ошибка установки уставки для датчика {sensor_index}")
-
     def process_received_packet(self, payload):
         """Обработка принятого пакета"""
         self.last_alive_time = time.time() * 1000
@@ -344,6 +367,16 @@ class SensorApp:
         # Обработка Alive
         if cmd_code == self.UART_COMMANDS["UART_CMD_ALIVE"]:
             self.log_message("💓 Получен Alive ответ")
+            return
+            
+        # Обработка GET_SERIAL
+        if cmd_code == self.UART_COMMANDS["UART_CMD_GET_SERIAL"]:
+            self.process_serial_number(payload)
+            return
+            
+        # Обработка SET_SERIAL
+        if cmd_code == self.UART_COMMANDS["UART_CMD_SET_SERIAL"]:
+            self.process_set_serial_response(payload)
             return
             
         # Обработка количества датчиков
@@ -375,6 +408,60 @@ class SensorApp:
             return
             
         self.log_message(f"⚠️ Неизвестная команда: 0x{cmd_code:04X}")
+
+    def process_serial_number(self, payload):
+        """Обработка ответа с серийным номером"""
+        if len(payload) >= 18:  # 2 байта команды + 16 байт серийного номера
+            # Извлекаем 16 байт серийного номера
+            serial_bytes = payload[2:18]
+            
+            try:
+                # Пытаемся декодировать как ASCII
+                serial_str = serial_bytes.decode('ascii', errors='ignore')
+                
+                # Удаляем непечатаемые символы
+                serial_str = ''.join(char for char in serial_str if char.isprintable())
+                
+                # Если строка короче 16 символов, дополняем пробелами
+                if len(serial_str) < 16:
+                    serial_str = serial_str.ljust(16, ' ')
+                
+                # Обновляем переменную и поле ввода в UI
+                self.serial_number = serial_str
+                self.root.after(0, self.update_serial_display)
+                
+                self.log_message(f"🔢 Получен серийный номер: '{serial_str}'")
+                self.log_message(f"   Длина: {len(serial_str)} символов")
+                self.log_message(f"   HEX: {serial_bytes.hex(' ')}")
+                
+            except Exception as e:
+                self.log_message(f"🔢 Ошибка декодирования серийного номера: {str(e)}")
+                self.log_message(f"   HEX: {serial_bytes.hex(' ')}")
+        else:
+            self.log_message("⚠️ Неверный формат серийного номера")
+            self.log_message(f"   Получено байт: {len(payload)}")
+
+    def process_set_serial_response(self, payload):
+        """Обработка ответа на установку серийного номера"""
+        if len(payload) >= 3:
+            status = payload[2]
+            if status == 1:
+                self.log_message("✅ Серийный номер успешно установлен")
+            else:
+                self.log_message("❌ Ошибка установки серийного номера")
+        else:
+            self.log_message("⚠️ Неверный формат ответа установки серийного номера")
+
+    def update_serial_display(self):
+        """Обновление отображения серийного номера в UI"""
+        if hasattr(self, 'serial_label'):
+            self.serial_label.config(text=f"Серийный номер: {self.serial_number}")
+        if hasattr(self, 'serial_entry'):
+            self.serial_entry.delete(0, tk.END)
+            self.serial_entry.insert(0, self.serial_number)
+            
+        # Логируем обновление
+        self.log_message(f"🔢 Обновлен серийный номер в UI: {self.serial_number}")
 
     def process_nack(self, payload):
         """Обработка NACK"""
@@ -515,6 +602,18 @@ class SensorApp:
         # Автоматически запускаем опрос после получения всей информации
         self.root.after(500, self.start_sensor_polling)
 
+    def process_set_fault_response(self, payload, cmd_code):
+        """Обработка ответа на установку уставки"""
+        # Вычисляем индекс датчика из команды
+        sensor_index = cmd_code - self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"]
+        
+        if len(payload) >= 3 and payload[2] == 1:  # Статус успеха
+            self.log_message(f"✅ Уставка для датчика {sensor_index} успешно установлена")
+            # После успешной установки запрашиваем обновленную информацию об уставках
+            self.root.after(100, self.request_faults_info)
+        else:
+            self.log_message(f"❌ Ошибка установки уставки для датчика {sensor_index}")
+
     def create_widgets(self):
         main_frame = tk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -546,6 +645,29 @@ class SensorApp:
         
         self.refresh_btn = tk.Button(com_frame, text="Обновить список", command=self.update_ports_list)
         self.refresh_btn.pack(side=tk.LEFT)
+        
+        # Serial number frame
+        serial_frame = tk.Frame(control_frame)
+        serial_frame.pack(fill=tk.X, pady=2)
+        
+        tk.Label(serial_frame, text="Серийный номер:").pack(side=tk.LEFT)
+        
+        # Валидация для поля ввода - только 16 символов
+        vcmd = (self.root.register(self.validate_serial_input), '%P')
+        self.serial_entry = tk.Entry(serial_frame, width=20, validate='key', validatecommand=vcmd)
+        self.serial_entry.pack(side=tk.LEFT, padx=5)
+        self.serial_entry.insert(0, self.serial_number)
+        
+        self.get_serial_btn = tk.Button(serial_frame, text="Запросить", 
+                                      command=self.request_serial_number, state=tk.DISABLED)
+        self.get_serial_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.set_serial_btn = tk.Button(serial_frame, text="Установить", 
+                                      command=self.set_serial_number, state=tk.DISABLED)
+        self.set_serial_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.serial_label = tk.Label(serial_frame, text=f"Серийный номер: {self.serial_number}")
+        self.serial_label.pack(side=tk.LEFT, padx=(20, 0))
         
         # Control buttons frame
         btn_frame = tk.Frame(control_frame)
@@ -596,6 +718,35 @@ class SensorApp:
         self.context_menu.add_command(label="Копировать", command=self.copy_from_log)
         self.context_menu.add_command(label="Очистить лог", command=self.clear_log)
         self.system_text.bind("<Button-3>", self.show_context_menu)
+
+    def validate_serial_input(self, new_text):
+        """Валидация ввода серийного номера - максимум 16 символов"""
+        return len(new_text) <= 16
+
+    def set_serial_number(self):
+        """Установка серийного номера"""
+        serial_str = self.serial_entry.get().strip()
+        
+        if len(serial_str) != 16:
+            messagebox.showerror("Ошибка", f"Серийный номер должен быть длиной 16 символов\nТекущая длина: {len(serial_str)} символов")
+            return
+            
+        # Проверяем что все символы ASCII
+        try:
+            serial_bytes = serial_str.encode('ascii')
+        except UnicodeEncodeError:
+            messagebox.showerror("Ошибка", "Серийный номер должен содержать только ASCII символы")
+            return
+            
+        # Собираем payload: команда + 16 байт серийного номера
+        parameter = bytearray(serial_bytes)  # 16 байт серийного номера
+        
+        payload = self.build_command_payload("UART_CMD_SET_SERIAL", parameter)
+        if self.send_packet(payload):
+            self.log_message(f"🔢 Отправка серийного номера: {serial_str}")
+            self.log_message(f"   Длина: {len(serial_str)} символов")
+            # После отправки запрашиваем обновленный серийный номер
+            self.root.after(500, self.request_serial_number)
 
     def create_sensor_tabs(self):
         """Создание вкладок для датчиков"""
@@ -843,23 +994,6 @@ class SensorApp:
         
         self.root.after(self.polling_interval, self.poll_sensors)
 
-    def _request_faults_delayed(self):
-        """Отложенный запрос уставок"""
-        if self.polling_active and self.connected:
-            self.request_faults_info()
-        self._faults_pending = False
-
-    def process_set_fault_response(self, payload, cmd_code):
-        """Обработка ответа на установку уставки"""
-        sensor_index = cmd_code - self.UART_COMMANDS["UART_CMD_SET_FAULT_VALUE"]
-        
-        if len(payload) >= 3 and payload[2] == 1:  # Статус успеха
-            self.log_message(f"✅ Уставка для датчика {sensor_index} успешно установлена")
-            # После успешной установки запрашиваем обновленную информацию об уставках
-            self.root.after(100, self.request_faults_info)
-        else:
-            self.log_message(f"❌ Ошибка установки уставки для датчика {sensor_index}")
-
     def request_initial_config(self):
         """Запрос начальной конфигурации"""
         self.log_message("📋 Запрос начальной конфигурации устройства...")
@@ -959,6 +1093,8 @@ class SensorApp:
             self.connect_btn.config(state=tk.DISABLED)
             self.disconnect_btn.config(state=tk.NORMAL)
             self.get_sensors_btn.config(state=tk.NORMAL)
+            self.get_serial_btn.config(state=tk.NORMAL)
+            self.set_serial_btn.config(state=tk.NORMAL)
             self.port_combobox.config(state='disabled')
             self.baud_combobox.config(state='disabled')
             
@@ -966,6 +1102,9 @@ class SensorApp:
             
             # Автоматически запрашиваем конфигурацию при подключении
             self.root.after(1000, self.request_initial_config)
+            
+            # Запрашиваем серийный номер при подключении
+            self.root.after(1500, self.request_serial_number)
             
         except Exception as e:
             self.log_message(f"❌ Ошибка подключения к {port_name}: {str(e)}")
@@ -1023,6 +1162,8 @@ class SensorApp:
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
         self.get_sensors_btn.config(state=tk.DISABLED)
+        self.get_serial_btn.config(state=tk.DISABLED)
+        self.set_serial_btn.config(state=tk.DISABLED)
         self.start_poll_btn.config(state=tk.DISABLED)
         self.stop_poll_btn.config(state=tk.DISABLED)
         self.port_combobox.config(state='readonly')

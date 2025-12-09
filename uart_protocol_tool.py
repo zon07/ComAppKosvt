@@ -37,14 +37,16 @@ class SimpleUARTApp:
             "UART_CMD_GET_SENSORS_VALUE": 0x3000,       # Запрос значений всех датчиков
             "UART_CMD_GET_FAULTS_INFO": 0x4000,         # Запрос текущей информации об уставках
             "UART_CMD_GET_SERIAL": 0xF500,              # Запрос серийного номера
-
+            "UART_CMD_GET_SA":     0xF600,              # Запрос текущего I2C SA адреса
+            
             # --- Команды записи (SET) ---
             "UART_CMD_SET_FAULT_VALUE_0": 0x5000,         # Установки аварийного уровня Датчик 0
             "UART_CMD_SET_FAULT_VALUE_1": 0x5001,         # Установки аварийного уровня Датчик 1
             "UART_CMD_SET_FAULT_VALUE_2": 0x5002,         # Установки аварийного уровня Датчик 2
             "UART_CMD_SET_FAULT_VALUE_3": 0x5003,         # Установки аварийного уровня Датчик 3
             "UART_CMD_SET_FAULT_VALUE_4": 0x5004,         # Установки аварийного уровня Датчик 4                                    
-            "UART_CMD_SET_SERIAL": 0xF505,              # Записать серийный номер
+            "UART_CMD_SET_SERIAL":        0xF505,         # Записать серийный номер
+            "UART_CMD_SET_SA":            0xF605,         # Установка нового I2S SA адреса
 
             # --- Старые команды (сохранены для обратной совместимости) ---
             "UART_CMD_NACK": 0xE000,                    # Команда отрицательного подтверждения
@@ -81,6 +83,7 @@ class SimpleUARTApp:
             "UART_CMD_GET_SENSORS_VALUE": "Запрос значений всех датчиков",
             "UART_CMD_GET_FAULTS_INFO": "Запрос текущей информации об уставках",
             "UART_CMD_GET_SERIAL": "Запрос серийного номера",
+            "UART_CMD_GET_SA":     "Запрос текущего I2C SA адреса",
 
             # --- Команды записи (SET) ---
             "UART_CMD_SET_FAULT_VALUE_0": "Установки аварийного уровня Датчик 0",
@@ -89,7 +92,8 @@ class SimpleUARTApp:
             "UART_CMD_SET_FAULT_VALUE_3": "Установки аварийного уровня Датчик 3",
             "UART_CMD_SET_FAULT_VALUE_4": "Установки аварийного уровня Датчик 4", 
             "UART_CMD_SET_SERIAL": "Записать серийный номер",
-
+            "UART_CMD_SET_SA":     "Установка нового I2S SA адреса",
+            
             # --- Старые команды (сохранены для обратной совместимости) ---
             "UART_CMD_NACK": "Команда отрицательного подтверждения",
             "UART_CMD_ALIVE": "Команда проверки активности системы",
