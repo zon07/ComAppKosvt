@@ -36,10 +36,11 @@ class SensorApp:
             "UART_CMD_SET_FAULT_VALUE": 0x5000,
             "UART_CMD_NACK": 0xE000,
             "UART_CMD_ALIVE": 0xE001,
-            "UART_CMD_GET_SERIAL": 0xF500,          # Запрос серийного номера
-            "UART_CMD_SET_SERIAL": 0xF505,          # Запись серийного номера
+            "UART_CMD_GET_SERIAL": 0xF500,
+            "UART_CMD_SET_SERIAL": 0xF505,
+            "UART_CMD_GET_MODE": 0xE003,
         }
-        
+              
         # Sensor types
         self.sensor_types = {
             0: "UNDEFINED",
@@ -75,6 +76,15 @@ class SensorApp:
         
         # Serial number
         self.serial_number = "0000000000000000"  # 16 символов по умолчанию
+        
+        # Modes
+        self.mode_descriptions = {
+            0: "UNDEF",
+            1: "NORMAL_0",
+            2: "NORMAL_1",
+            3: "FACTORY_TEST",
+        }
+        self.current_mode = 0
         
         # Sensor polling
         self.polling_interval = 500
@@ -378,6 +388,16 @@ class SensorApp:
         if cmd_code == self.UART_COMMANDS["UART_CMD_SET_SERIAL"]:
             self.process_set_serial_response(payload)
             return
+        
+        # ДОБАВЛЕНО: Обработка GET_MODE
+        if cmd_code == self.UART_COMMANDS["UART_CMD_GET_MODE"]:
+            self.process_mode_response(payload)
+            return
+            
+        # ДОБАВЛЕНО: Обработка SET_MODE
+        if cmd_code == self.UART_COMMANDS["UART_CMD_SET_MODE"]:
+            self.process_set_mode_response(payload)
+            return
             
         # Обработка количества датчиков
         if cmd_code == self.UART_COMMANDS["UART_CMD_GET_SENSOR_COUNT"]:
@@ -409,6 +429,84 @@ class SensorApp:
             
         self.log_message(f"⚠️ Неизвестная команда: 0x{cmd_code:04X}")
 
+    def request_mode(self):
+        """Запрос текущего режима работы"""
+        payload = self.build_command_payload("UART_CMD_GET_MODE")
+        if self.send_packet(payload):
+            self.log_message("⚙️ Запрос режима работы")
+
+    def set_mode(self, mode_value):
+        """Установка режима работы"""
+        if mode_value < 0 or mode_value > 255:
+            messagebox.showerror("Ошибка", "Недопустимое значение режима (0-255)")
+            return
+        
+        # Собираем параметр: 1 байт - значение режима
+        parameter = bytearray([mode_value])
+        
+        payload = self.build_command_payload("UART_CMD_SET_MODE", parameter)
+        if self.send_packet(payload):
+            self.log_message(f"⚙️ Установка режима: {mode_value}")
+            # После отправки запрашиваем обновленный режим
+            self.root.after(500, self.request_mode)
+
+    def process_mode_response(self, payload):
+        """Обработка ответа с режимом работы"""
+        if len(payload) >= 3:
+            mode_value = payload[2]  # Режим находится в третьем байте
+            self.current_mode = mode_value
+            
+            # Получаем описание режима
+            mode_description = self.mode_descriptions.get(
+                mode_value, f"Неизвестный режим (код: {mode_value})"
+            )
+            
+            self.log_message(f"⚙️ Текущий режим работы: {mode_description}")
+            
+            # Обновляем отображение в UI
+            self.root.after(0, lambda: self.update_mode_display(mode_value, mode_description))
+        else:
+            self.log_message("⚠️ Неверный формат ответа режима работы")
+
+    def process_set_mode_response(self, payload):
+        """Обработка ответа на установку режима"""
+        if len(payload) >= 3:
+            status = payload[2]
+            if status == 1:
+                self.log_message("✅ Режим работы успешно установлен")
+                # После успешной установки запрашиваем обновленный режим
+                self.root.after(100, self.request_mode)
+            else:
+                self.log_message("❌ Ошибка установки режима работы")
+        else:
+            self.log_message("⚠️ Неверный формат ответа установки режима")
+
+    def update_mode_display(self, mode_value, mode_description):
+        """Обновление отображения режима работы в UI"""
+        if hasattr(self, 'mode_label'):
+            # Определяем цвет в зависимости от режима
+            colors = {
+                0: "green",     # Нормальный
+                1: "orange",    # Калибровочный
+                2: "blue",      # Тестовый
+                3: "purple",    # Отладка
+                4: "cyan",      # Обслуживание
+                5: "red",       # Аварийный
+            }
+            color = colors.get(mode_value, "black")
+            
+            self.mode_label.config(
+                text=f"Режим: {mode_description} ({mode_value})",
+                fg=color,
+                font=("Arial", 9, "bold")
+            )
+        
+        # Обновляем поле ввода режима если есть
+        if hasattr(self, 'mode_entry'):
+            self.mode_entry.delete(0, tk.END)
+            self.mode_entry.insert(0, str(mode_value))
+
+
     def process_serial_number(self, payload):
         """Обработка ответа с серийным номером"""
         if len(payload) >= 18:  # 2 байта команды + 16 байт серийного номера
@@ -426,9 +524,11 @@ class SensorApp:
                 if len(serial_str) < 16:
                     serial_str = serial_str.ljust(16, ' ')
                 
-                # Обновляем переменную и поле ввода в UI
+                # Обновляем переменную и метку в UI, но НЕ поле ввода
                 self.serial_number = serial_str
-                self.root.after(0, self.update_serial_display)
+                
+                # Обновляем только метку, а не поле ввода
+                self.root.after(0, lambda: self.update_serial_label_only())
                 
                 self.log_message(f"🔢 Получен серийный номер: '{serial_str}'")
                 self.log_message(f"   Длина: {len(serial_str)} символов")
@@ -440,6 +540,15 @@ class SensorApp:
         else:
             self.log_message("⚠️ Неверный формат серийного номера")
             self.log_message(f"   Получено байт: {len(payload)}")
+
+    def update_serial_label_only(self):
+        """Обновление только метки серийного номера в UI"""
+        if hasattr(self, 'serial_label'):
+            self.serial_label.config(text=f"Серийный номер: {self.serial_number}")
+        # НЕ обновляем поле ввода!
+        
+        # Логируем обновление
+        self.log_message(f"🔢 Обновлен серийный номер в UI (только метка): {self.serial_number}")
 
     def process_set_serial_response(self, payload):
         """Обработка ответа на установку серийного номера"""
@@ -453,15 +562,17 @@ class SensorApp:
             self.log_message("⚠️ Неверный формат ответа установки серийного номера")
 
     def update_serial_display(self):
-        """Обновление отображения серийного номера в UI"""
+        """Полное обновление отображения серийного номера в UI"""
         if hasattr(self, 'serial_label'):
             self.serial_label.config(text=f"Серийный номер: {self.serial_number}")
         if hasattr(self, 'serial_entry'):
+            # Если нужно обновить и поле ввода - оставляем эту логику
+            # Но не используем этот метод при автоматическом запросе серийного номера
             self.serial_entry.delete(0, tk.END)
             self.serial_entry.insert(0, self.serial_number)
             
         # Логируем обновление
-        self.log_message(f"🔢 Обновлен серийный номер в UI: {self.serial_number}")
+        self.log_message(f"🔢 Полное обновление серийного номера в UI: {self.serial_number}")
 
     def process_nack(self, payload):
         """Обработка NACK"""
@@ -632,7 +743,7 @@ class SensorApp:
         
         tk.Label(com_frame, text="Скорость:").pack(side=tk.LEFT, padx=(10,0))
         self.baud_combobox = ttk.Combobox(com_frame, values=["9600", "19200", "38400", "57600", "115200"], 
-                                         state="readonly", width=10)
+                                        state="readonly", width=10)
         self.baud_combobox.set("9600")
         self.baud_combobox.pack(side=tk.LEFT, padx=5)
         
@@ -640,7 +751,7 @@ class SensorApp:
         self.connect_btn.pack(side=tk.LEFT, padx=5)
         
         self.disconnect_btn = tk.Button(com_frame, text="Закрыть порт", 
-                                      command=self.disconnect_port, state=tk.DISABLED)
+                                    command=self.disconnect_port, state=tk.DISABLED)
         self.disconnect_btn.pack(side=tk.LEFT, padx=5)
         
         self.refresh_btn = tk.Button(com_frame, text="Обновить список", command=self.update_ports_list)
@@ -659,30 +770,54 @@ class SensorApp:
         self.serial_entry.insert(0, self.serial_number)
         
         self.get_serial_btn = tk.Button(serial_frame, text="Запросить", 
-                                      command=self.request_serial_number, state=tk.DISABLED)
+                                    command=self.request_serial_number, state=tk.DISABLED)
         self.get_serial_btn.pack(side=tk.LEFT, padx=5)
         
         self.set_serial_btn = tk.Button(serial_frame, text="Установить", 
-                                      command=self.set_serial_number, state=tk.DISABLED)
+                                    command=self.set_serial_number, state=tk.DISABLED)
         self.set_serial_btn.pack(side=tk.LEFT, padx=5)
         
         self.serial_label = tk.Label(serial_frame, text=f"Серийный номер: {self.serial_number}")
         self.serial_label.pack(side=tk.LEFT, padx=(20, 0))
+        
+        # ДОБАВЛЕНО: Режим работы frame
+        mode_frame = tk.Frame(control_frame)
+        mode_frame.pack(fill=tk.X, pady=2)
+        
+        tk.Label(mode_frame, text="Режим:").pack(side=tk.LEFT)
+        
+        # Поле ввода режима
+        self.mode_entry = tk.Entry(mode_frame, width=5)
+        self.mode_entry.pack(side=tk.LEFT, padx=5)
+        self.mode_entry.insert(0, "0")
+        
+        self.get_mode_btn = tk.Button(mode_frame, text="Запросить", 
+                                    command=self.request_mode, state=tk.DISABLED)
+        self.get_mode_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.set_mode_btn = tk.Button(mode_frame, text="Установить", 
+                                    command=lambda: self.set_mode(int(self.mode_entry.get())), 
+                                    state=tk.DISABLED)
+        self.set_mode_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Метка для отображения текущего режима
+        self.mode_label = tk.Label(mode_frame, text="Режим: Неизвестен", fg="gray")
+        self.mode_label.pack(side=tk.LEFT, padx=(20, 0))
         
         # Control buttons frame
         btn_frame = tk.Frame(control_frame)
         btn_frame.pack(fill=tk.X, pady=2)
         
         self.get_sensors_btn = tk.Button(btn_frame, text="Запросить датчики", 
-                                       command=self.request_initial_config, state=tk.DISABLED)
+                                    command=self.request_initial_config, state=tk.DISABLED)
         self.get_sensors_btn.pack(side=tk.LEFT, padx=5)
         
         self.start_poll_btn = tk.Button(btn_frame, text="Старт опроса", 
-                                      command=self.start_sensor_polling, state=tk.DISABLED)
+                                    command=self.start_sensor_polling, state=tk.DISABLED)
         self.start_poll_btn.pack(side=tk.LEFT, padx=5)
         
         self.stop_poll_btn = tk.Button(btn_frame, text="Стоп опроса", 
-                                     command=self.stop_sensor_polling, state=tk.DISABLED)
+                                    command=self.stop_sensor_polling, state=tk.DISABLED)
         self.stop_poll_btn.pack(side=tk.LEFT, padx=5)
         
         # Status label
@@ -1095,6 +1230,8 @@ class SensorApp:
             self.get_sensors_btn.config(state=tk.NORMAL)
             self.get_serial_btn.config(state=tk.NORMAL)
             self.set_serial_btn.config(state=tk.NORMAL)
+            self.get_mode_btn.config(state=tk.NORMAL)     # ДОБАВЛЕНО
+            self.set_mode_btn.config(state=tk.NORMAL)     # ДОБАВЛЕНО
             self.port_combobox.config(state='disabled')
             self.baud_combobox.config(state='disabled')
             
@@ -1105,6 +1242,9 @@ class SensorApp:
             
             # Запрашиваем серийный номер при подключении
             self.root.after(1500, self.request_serial_number)
+            
+            # ДОБАВЛЕНО: Запрашиваем режим работы при подключении
+            self.root.after(2000, self.request_mode)
             
         except Exception as e:
             self.log_message(f"❌ Ошибка подключения к {port_name}: {str(e)}")
@@ -1164,6 +1304,8 @@ class SensorApp:
         self.get_sensors_btn.config(state=tk.DISABLED)
         self.get_serial_btn.config(state=tk.DISABLED)
         self.set_serial_btn.config(state=tk.DISABLED)
+        self.get_mode_btn.config(state=tk.DISABLED)   # ДОБАВЛЕНО
+        self.set_mode_btn.config(state=tk.DISABLED)   # ДОБАВЛЕНО
         self.start_poll_btn.config(state=tk.DISABLED)
         self.stop_poll_btn.config(state=tk.DISABLED)
         self.port_combobox.config(state='readonly')
@@ -1171,6 +1313,10 @@ class SensorApp:
         
         self.status_label.config(text="Статус: Не подключено")
         self.alive_status.config(text="[ALIVE: ---]", fg="gray")
+        
+        # Сбрасываем режим
+        self.mode_label.config(text="Режим: Неизвестен", fg="gray")
+        self.current_mode = 0
         
         self.sensor_data = {}
         self.sensor_info = {}
