@@ -38,9 +38,9 @@ class SensorApp:
             "UART_CMD_ALIVE": 0xE001,
             "UART_CMD_GET_SERIAL": 0xF500,
             "UART_CMD_SET_SERIAL": 0xF505,
-            "UART_CMD_GET_MODE": 0xE003,
+            "UART_CMD_GET_MODE": 0xE003,          # Только чтение режима
         }
-              
+        
         # Sensor types
         self.sensor_types = {
             0: "UNDEFINED",
@@ -77,7 +77,7 @@ class SensorApp:
         # Serial number
         self.serial_number = "0000000000000000"  # 16 символов по умолчанию
         
-        # Modes
+        # Modes - только чтение
         self.mode_descriptions = {
             0: "UNDEF",
             1: "NORMAL_0",
@@ -307,29 +307,11 @@ class SensorApp:
         if self.send_packet(payload):
             self.log_message("🔢 Запрос серийного номера")
 
-    def set_serial_number(self):
-        """Установка серийного номера"""
-        serial_str = self.serial_entry.get().strip()
-        
-        if len(serial_str) != 16:
-            messagebox.showerror("Ошибка", "Серийный номер должен быть длиной 16 символов")
-            return
-            
-        # Проверяем что все символы ASCII
-        try:
-            serial_bytes = serial_str.encode('ascii')
-        except UnicodeEncodeError:
-            messagebox.showerror("Ошибка", "Серийный номер должен содержать только ASCII символы")
-            return
-            
-        # Собираем payload: команда + 16 байт серийного номера
-        parameter = bytearray(serial_bytes)  # 16 байт серийного номера
-        
-        payload = self.build_command_payload("UART_CMD_SET_SERIAL", parameter)
+    def request_mode(self):
+        """Запрос текущего режима работы"""
+        payload = self.build_command_payload("UART_CMD_GET_MODE")
         if self.send_packet(payload):
-            self.log_message(f"🔢 Отправка серийного номера: {serial_str}")
-            # После отправки запрашиваем обновленный серийный номер
-            self.root.after(500, self.request_serial_number)
+            self.log_message("⚙️ Запрос режима работы")
 
     def send_fault_value(self, sensor_index, fault_value_raw, is_fault_on):
         """Отправка уставки для датчика"""
@@ -389,14 +371,9 @@ class SensorApp:
             self.process_set_serial_response(payload)
             return
         
-        # ДОБАВЛЕНО: Обработка GET_MODE
+        # Обработка GET_MODE
         if cmd_code == self.UART_COMMANDS["UART_CMD_GET_MODE"]:
             self.process_mode_response(payload)
-            return
-            
-        # ДОБАВЛЕНО: Обработка SET_MODE
-        if cmd_code == self.UART_COMMANDS["UART_CMD_SET_MODE"]:
-            self.process_set_mode_response(payload)
             return
             
         # Обработка количества датчиков
@@ -429,27 +406,6 @@ class SensorApp:
             
         self.log_message(f"⚠️ Неизвестная команда: 0x{cmd_code:04X}")
 
-    def request_mode(self):
-        """Запрос текущего режима работы"""
-        payload = self.build_command_payload("UART_CMD_GET_MODE")
-        if self.send_packet(payload):
-            self.log_message("⚙️ Запрос режима работы")
-
-    def set_mode(self, mode_value):
-        """Установка режима работы"""
-        if mode_value < 0 or mode_value > 255:
-            messagebox.showerror("Ошибка", "Недопустимое значение режима (0-255)")
-            return
-        
-        # Собираем параметр: 1 байт - значение режима
-        parameter = bytearray([mode_value])
-        
-        payload = self.build_command_payload("UART_CMD_SET_MODE", parameter)
-        if self.send_packet(payload):
-            self.log_message(f"⚙️ Установка режима: {mode_value}")
-            # После отправки запрашиваем обновленный режим
-            self.root.after(500, self.request_mode)
-
     def process_mode_response(self, payload):
         """Обработка ответа с режимом работы"""
         if len(payload) >= 3:
@@ -468,44 +424,23 @@ class SensorApp:
         else:
             self.log_message("⚠️ Неверный формат ответа режима работы")
 
-    def process_set_mode_response(self, payload):
-        """Обработка ответа на установку режима"""
-        if len(payload) >= 3:
-            status = payload[2]
-            if status == 1:
-                self.log_message("✅ Режим работы успешно установлен")
-                # После успешной установки запрашиваем обновленный режим
-                self.root.after(100, self.request_mode)
-            else:
-                self.log_message("❌ Ошибка установки режима работы")
-        else:
-            self.log_message("⚠️ Неверный формат ответа установки режима")
-
     def update_mode_display(self, mode_value, mode_description):
         """Обновление отображения режима работы в UI"""
         if hasattr(self, 'mode_label'):
             # Определяем цвет в зависимости от режима
             colors = {
-                0: "green",     # Нормальный
-                1: "orange",    # Калибровочный
-                2: "blue",      # Тестовый
-                3: "purple",    # Отладка
-                4: "cyan",      # Обслуживание
-                5: "red",       # Аварийный
+                0: "gray",      # UNDEF
+                1: "green",     # NORMAL_0
+                2: "blue",      # NORMAL_1
+                3: "orange",    # FACTORY_TEST
             }
             color = colors.get(mode_value, "black")
             
             self.mode_label.config(
-                text=f"Режим: {mode_description} ({mode_value})",
+                text=f"Режим: {mode_description}",
                 fg=color,
                 font=("Arial", 9, "bold")
             )
-        
-        # Обновляем поле ввода режима если есть
-        if hasattr(self, 'mode_entry'):
-            self.mode_entry.delete(0, tk.END)
-            self.mode_entry.insert(0, str(mode_value))
-
 
     def process_serial_number(self, payload):
         """Обработка ответа с серийным номером"""
@@ -546,9 +481,6 @@ class SensorApp:
         if hasattr(self, 'serial_label'):
             self.serial_label.config(text=f"Серийный номер: {self.serial_number}")
         # НЕ обновляем поле ввода!
-        
-        # Логируем обновление
-        self.log_message(f"🔢 Обновлен серийный номер в UI (только метка): {self.serial_number}")
 
     def process_set_serial_response(self, payload):
         """Обработка ответа на установку серийного номера"""
@@ -560,19 +492,6 @@ class SensorApp:
                 self.log_message("❌ Ошибка установки серийного номера")
         else:
             self.log_message("⚠️ Неверный формат ответа установки серийного номера")
-
-    def update_serial_display(self):
-        """Полное обновление отображения серийного номера в UI"""
-        if hasattr(self, 'serial_label'):
-            self.serial_label.config(text=f"Серийный номер: {self.serial_number}")
-        if hasattr(self, 'serial_entry'):
-            # Если нужно обновить и поле ввода - оставляем эту логику
-            # Но не используем этот метод при автоматическом запросе серийного номера
-            self.serial_entry.delete(0, tk.END)
-            self.serial_entry.insert(0, self.serial_number)
-            
-        # Логируем обновление
-        self.log_message(f"🔢 Полное обновление серийного номера в UI: {self.serial_number}")
 
     def process_nack(self, payload):
         """Обработка NACK"""
@@ -780,29 +699,18 @@ class SensorApp:
         self.serial_label = tk.Label(serial_frame, text=f"Серийный номер: {self.serial_number}")
         self.serial_label.pack(side=tk.LEFT, padx=(20, 0))
         
-        # ДОБАВЛЕНО: Режим работы frame
+        # Режим работы frame (только отображение)
         mode_frame = tk.Frame(control_frame)
         mode_frame.pack(fill=tk.X, pady=2)
         
-        tk.Label(mode_frame, text="Режим:").pack(side=tk.LEFT)
-        
-        # Поле ввода режима
-        self.mode_entry = tk.Entry(mode_frame, width=5)
-        self.mode_entry.pack(side=tk.LEFT, padx=5)
-        self.mode_entry.insert(0, "0")
-        
-        self.get_mode_btn = tk.Button(mode_frame, text="Запросить", 
-                                    command=self.request_mode, state=tk.DISABLED)
-        self.get_mode_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.set_mode_btn = tk.Button(mode_frame, text="Установить", 
-                                    command=lambda: self.set_mode(int(self.mode_entry.get())), 
-                                    state=tk.DISABLED)
-        self.set_mode_btn.pack(side=tk.LEFT, padx=5)
-        
         # Метка для отображения текущего режима
         self.mode_label = tk.Label(mode_frame, text="Режим: Неизвестен", fg="gray")
-        self.mode_label.pack(side=tk.LEFT, padx=(20, 0))
+        self.mode_label.pack(side=tk.LEFT)
+        
+        # Кнопка для запроса режима
+        self.get_mode_btn = tk.Button(mode_frame, text="Обновить режим", 
+                                    command=self.request_mode, state=tk.DISABLED)
+        self.get_mode_btn.pack(side=tk.LEFT, padx=(20, 0))
         
         # Control buttons frame
         btn_frame = tk.Frame(control_frame)
@@ -1230,8 +1138,7 @@ class SensorApp:
             self.get_sensors_btn.config(state=tk.NORMAL)
             self.get_serial_btn.config(state=tk.NORMAL)
             self.set_serial_btn.config(state=tk.NORMAL)
-            self.get_mode_btn.config(state=tk.NORMAL)     # ДОБАВЛЕНО
-            self.set_mode_btn.config(state=tk.NORMAL)     # ДОБАВЛЕНО
+            self.get_mode_btn.config(state=tk.NORMAL)  # Включаем кнопку запроса режима
             self.port_combobox.config(state='disabled')
             self.baud_combobox.config(state='disabled')
             
@@ -1243,7 +1150,7 @@ class SensorApp:
             # Запрашиваем серийный номер при подключении
             self.root.after(1500, self.request_serial_number)
             
-            # ДОБАВЛЕНО: Запрашиваем режим работы при подключении
+            # Запрашиваем режим работы при подключении
             self.root.after(2000, self.request_mode)
             
         except Exception as e:
@@ -1304,8 +1211,7 @@ class SensorApp:
         self.get_sensors_btn.config(state=tk.DISABLED)
         self.get_serial_btn.config(state=tk.DISABLED)
         self.set_serial_btn.config(state=tk.DISABLED)
-        self.get_mode_btn.config(state=tk.DISABLED)   # ДОБАВЛЕНО
-        self.set_mode_btn.config(state=tk.DISABLED)   # ДОБАВЛЕНО
+        self.get_mode_btn.config(state=tk.DISABLED)  # Отключаем кнопку запроса режима
         self.start_poll_btn.config(state=tk.DISABLED)
         self.stop_poll_btn.config(state=tk.DISABLED)
         self.port_combobox.config(state='readonly')
